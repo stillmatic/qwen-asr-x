@@ -13,7 +13,6 @@ API:
 import argparse
 import asyncio
 import os
-import threading
 import time
 import traceback
 import uuid
@@ -25,7 +24,7 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from pipeline import PipelineConfig, _log, run_pipeline
+from pipeline import Pipeline, PipelineConfig, _log
 
 
 # --- Models ---
@@ -63,32 +62,26 @@ class TranscribeRequest(BaseModel):
 
 jobs: dict[str, Job] = {}
 job_queue: asyncio.Queue = None
-pipeline_config: PipelineConfig = None
+pipeline: Pipeline = None
 
 
 # --- Worker ---
 
 def _process_job(job: Job):
-    """Run the pipeline for a single job (called from worker thread)."""
+    """Run transcription using the pre-loaded pipeline."""
     job.status = JobStatus.processing
     job.started_at = time.time()
     _log(f"Job {job.job_id}: processing {job.audio_path}")
 
     try:
-        config = PipelineConfig(
-            model=pipeline_config.model,
-            aligner=pipeline_config.aligner,
-            device=pipeline_config.device,
+        segments = pipeline.transcribe(
+            job.audio_path,
+            language=job.config.get("language"),
             align=job.config.get("align", True),
             diarize=job.config.get("diarize", False),
-            diarize_model=pipeline_config.diarize_model,
-            hf_token=pipeline_config.hf_token,
             min_speakers=job.config.get("min_speakers"),
             max_speakers=job.config.get("max_speakers"),
-            language=job.config.get("language"),
-            batch_size=pipeline_config.batch_size,
         )
-        segments = run_pipeline(job.audio_path, config)
         job.result = [asdict(s) for s in segments]
         job.status = JobStatus.done
         _log(f"Job {job.job_id}: done ({len(segments)} segments)")
@@ -208,20 +201,27 @@ def main():
     parser.add_argument("--aligner", default="Qwen/Qwen3-ForcedAligner-0.6B", help="Aligner model")
     parser.add_argument("--device", default="cuda:0", help="Device")
     parser.add_argument("--batch-size", type=int, default=4, help="Batch size")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.8, help="vLLM GPU memory target")
     parser.add_argument("--hf-token", default=None, help="HF token for diarization")
+    parser.add_argument("--diarize", action="store_true", help="Pre-load diarization model")
     args = parser.parse_args()
 
-    global pipeline_config
-    pipeline_config = PipelineConfig(
+    config = PipelineConfig(
         model=args.model,
         aligner=args.aligner,
         device=args.device,
         batch_size=args.batch_size,
+        gpu_memory_utilization=args.gpu_memory_utilization,
         hf_token=args.hf_token or os.environ.get("HF_TOKEN"),
+        diarize=args.diarize,
     )
 
+    # Load all models once at startup
+    global pipeline
+    _log(f"Initializing pipeline: {args.model}")
+    pipeline = Pipeline(config)
+
     _log(f"Starting server on {args.host}:{args.port}")
-    _log(f"Model: {args.model}, Aligner: {args.aligner}, Device: {args.device}")
     uvicorn.run(app, host=args.host, port=args.port)
 
 

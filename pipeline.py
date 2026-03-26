@@ -50,132 +50,160 @@ def _free_gpu():
         torch.cuda.empty_cache()
 
 
-def run_pipeline(audio_path: str, config: PipelineConfig) -> list[TranscriptSegment]:
-    """Run the full VAD -> ASR -> alignment -> diarization pipeline."""
-    _log(f"Loading audio: {audio_path}")
-    audio = load_audio(audio_path)
-    duration = len(audio) / SAMPLE_RATE
-    _log(f"Audio loaded: {duration:.1f}s ({len(audio)} samples)")
+class Pipeline:
+    """Holds loaded models and runs transcription jobs without reloading."""
 
-    # VAD
-    _log("Loading VAD model...")
-    vad_model = load_vad_model()
-    _log("Running VAD...")
-    vad_segments = detect_speech(
-        audio,
-        vad_model,
-        threshold=config.vad_threshold,
-        max_speech_duration_s=config.max_speech_duration_s,
-        merge_gap_s=config.merge_gap_s,
-    )
-    _log(f"VAD found {len(vad_segments)} speech segments")
-    del vad_model
+    def __init__(self, config: PipelineConfig):
+        self.config = config
 
-    if not vad_segments:
-        _log("No speech detected")
-        return []
+        # Load VAD model
+        _log("Loading VAD model...")
+        self.vad_model = load_vad_model()
 
-    # Kick off diarization in background thread (runs in parallel with ASR)
-    diarize_future = None
-    diar_pipeline = None
-    if config.diarize:
-        from diarize import load_diarization_pipeline, run_diarization
+        # Load ASR model (vLLM)
+        _log(f"Loading ASR model (vLLM): {config.model}")
+        aligner = config.aligner if config.align else None
+        aligner_kwargs = None
+        if aligner:
+            aligner_kwargs = {"device_map": config.device, "dtype": torch.bfloat16}
+            if config.hf_token:
+                aligner_kwargs["token"] = config.hf_token
 
-        _log(f"Loading diarization model: {config.diarize_model}")
-        diar_pipeline = load_diarization_pipeline(
-            model=config.diarize_model,
-            device=config.device,
+        self.asr = Qwen3ASRModel.LLM(
+            model=config.model,
+            forced_aligner=aligner,
+            forced_aligner_kwargs=aligner_kwargs,
+            max_inference_batch_size=config.batch_size,
+            max_new_tokens=512,
+            gpu_memory_utilization=config.gpu_memory_utilization,
+            dtype="bfloat16",
             hf_token=config.hf_token,
         )
 
-        def _run_diarize():
-            _log("Running diarization (background)...")
-            turns = run_diarization(
-                audio,
-                diar_pipeline,
-                min_speakers=config.min_speakers,
-                max_speakers=config.max_speakers,
+        # Optionally pre-load diarization
+        self.diar_pipeline = None
+        if config.diarize:
+            from diarize import load_diarization_pipeline
+
+            _log(f"Loading diarization model: {config.diarize_model}")
+            self.diar_pipeline = load_diarization_pipeline(
+                model=config.diarize_model,
+                device=config.device,
+                hf_token=config.hf_token,
             )
-            _log(f"Diarization complete: {len(set(t.speaker for t in turns))} speakers")
-            return turns
 
-        executor = ThreadPoolExecutor(max_workers=1)
-        diarize_future = executor.submit(_run_diarize)
+        _log("All models loaded")
 
-    # Load ASR model
-    _log(f"Loading ASR model (vLLM): {config.model}")
-    aligner = config.aligner if config.align else None
-    aligner_kwargs = None
-    if aligner:
-        aligner_kwargs = {"device_map": config.device, "dtype": torch.bfloat16}
-        if config.hf_token:
-            aligner_kwargs["token"] = config.hf_token
+    def transcribe(
+        self,
+        audio_path: str,
+        *,
+        language: Optional[str] = None,
+        align: Optional[bool] = None,
+        diarize: Optional[bool] = None,
+        min_speakers: Optional[int] = None,
+        max_speakers: Optional[int] = None,
+    ) -> list[TranscriptSegment]:
+        """Run VAD -> ASR -> alignment -> diarization on a single audio file."""
+        if align is None:
+            align = self.config.align
+        if diarize is None:
+            diarize = self.config.diarize
 
-    asr = Qwen3ASRModel.LLM(
-        model=config.model,
-        forced_aligner=aligner,
-        forced_aligner_kwargs=aligner_kwargs,
-        max_inference_batch_size=config.batch_size,
-        max_new_tokens=512,
-        gpu_memory_utilization=config.gpu_memory_utilization,
-        dtype="bfloat16",
-        hf_token=config.hf_token,
-    )
-    _log("ASR model loaded")
+        _log(f"Loading audio: {audio_path}")
+        audio = load_audio(audio_path)
+        duration = len(audio) / SAMPLE_RATE
+        _log(f"Audio loaded: {duration:.1f}s ({len(audio)} samples)")
 
-    segment_audio = [
-        (extract_segment_audio(audio, seg), SAMPLE_RATE) for seg in vad_segments
-    ]
-    _log(
-        f"Transcribing {len(vad_segments)} segments via in-process vLLM "
-        f"(max batch {config.batch_size})..."
-    )
-    transcriptions = asr.transcribe(
-        audio=segment_audio,
-        language=config.language,
-        return_time_stamps=config.align,
-    )
+        # VAD
+        _log("Running VAD...")
+        vad_segments = detect_speech(
+            audio,
+            self.vad_model,
+            threshold=self.config.vad_threshold,
+            max_speech_duration_s=self.config.max_speech_duration_s,
+            merge_gap_s=self.config.merge_gap_s,
+        )
+        _log(f"VAD found {len(vad_segments)} speech segments")
 
-    results: list[TranscriptSegment] = []
-    for seg, tx in zip(vad_segments, transcriptions):
-        text = (tx.text or "").strip()
-        if not text:
-            continue
+        if not vad_segments:
+            _log("No speech detected")
+            return []
 
-        words = []
-        if config.align and tx.time_stamps is not None:
-            for item in tx.time_stamps:
-                words.append(
-                    WordSegment(
-                        word=item.text,
-                        start=round(item.start_time + seg.start, 3),
-                        end=round(item.end_time + seg.start, 3),
-                    )
+        # Kick off diarization in background
+        diarize_future = None
+        if diarize and self.diar_pipeline:
+            from diarize import run_diarization
+
+            def _run_diarize():
+                _log("Running diarization (background)...")
+                turns = run_diarization(
+                    audio,
+                    self.diar_pipeline,
+                    min_speakers=min_speakers or self.config.min_speakers,
+                    max_speakers=max_speakers or self.config.max_speakers,
                 )
+                _log(f"Diarization complete: {len(set(t.speaker for t in turns))} speakers")
+                return turns
 
-        results.append(
-            TranscriptSegment(
-                start=round(seg.start, 3),
-                end=round(seg.end, 3),
-                text=text,
-                language=tx.language or "",
-                words=words,
-            )
+            executor = ThreadPoolExecutor(max_workers=1)
+            diarize_future = executor.submit(_run_diarize)
+
+        # ASR
+        segment_audio = [
+            (extract_segment_audio(audio, seg), SAMPLE_RATE) for seg in vad_segments
+        ]
+        _log(f"Transcribing {len(vad_segments)} segments...")
+        transcriptions = self.asr.transcribe(
+            audio=segment_audio,
+            language=language or self.config.language,
+            return_time_stamps=align,
         )
 
-    _log(f"Transcription complete: {len(results)} segments with text")
+        # Build results
+        results: list[TranscriptSegment] = []
+        for seg, tx in zip(vad_segments, transcriptions):
+            text = (tx.text or "").strip()
+            if not text:
+                continue
 
-    # Free ASR model
-    del asr
+            words = []
+            if align and tx.time_stamps is not None:
+                for item in tx.time_stamps:
+                    words.append(
+                        WordSegment(
+                            word=item.text,
+                            start=round(item.start_time + seg.start, 3),
+                            end=round(item.end_time + seg.start, 3),
+                        )
+                    )
+
+            results.append(
+                TranscriptSegment(
+                    start=round(seg.start, 3),
+                    end=round(seg.end, 3),
+                    text=text,
+                    language=tx.language or "",
+                    words=words,
+                )
+            )
+
+        _log(f"Transcription complete: {len(results)} segments with text")
+
+        # Wait for diarization
+        if diarize_future is not None:
+            from diarize import assign_speakers
+
+            turns = diarize_future.result()
+            results = assign_speakers(results, turns)
+
+        return results
+
+
+def run_pipeline(audio_path: str, config: PipelineConfig) -> list[TranscriptSegment]:
+    """One-shot convenience: load models, transcribe, discard models."""
+    pipe = Pipeline(config)
+    results = pipe.transcribe(audio_path)
+    del pipe
     _free_gpu()
-
-    # Wait for diarization and assign speakers
-    if diarize_future is not None:
-        from diarize import assign_speakers
-
-        turns = diarize_future.result()
-        results = assign_speakers(results, turns)
-        del diar_pipeline
-        _free_gpu()
-
     return results

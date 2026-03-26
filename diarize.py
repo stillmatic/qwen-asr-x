@@ -1,4 +1,6 @@
+from collections import deque
 from dataclasses import dataclass
+from typing import Iterable
 
 import numpy as np
 import torch
@@ -66,14 +68,34 @@ def assign_speakers(
     turns: list[SpeakerTurn],
 ) -> list[TranscriptSegment]:
     """Assign speaker labels to transcript segments and their words."""
+    if not segments or not turns:
+        return segments
+
+    ordered_turns = sorted(turns, key=lambda turn: (turn.start, turn.end))
+    targets: list[tuple[float, float, TranscriptSegment | WordSegment]] = []
     for seg in segments:
-        seg.speaker = _find_speaker(seg.start, seg.end, turns)
+        targets.append((seg.start, seg.end, seg))
         for word in seg.words:
-            word.speaker = _find_speaker(word.start, word.end, turns)
+            targets.append((word.start, word.end, word))
+
+    targets.sort(key=lambda item: (item[0], item[1]))
+
+    next_turn_idx = 0
+    active_turns: deque[SpeakerTurn] = deque()
+    for start, end, target in targets:
+        while next_turn_idx < len(ordered_turns) and ordered_turns[next_turn_idx].start < end:
+            active_turns.append(ordered_turns[next_turn_idx])
+            next_turn_idx += 1
+
+        while active_turns and active_turns[0].end <= start:
+            active_turns.popleft()
+
+        target.speaker = _find_best_overlap_speaker(start, end, active_turns)
+
     return segments
 
 
-def _find_speaker(start: float, end: float, turns: list[SpeakerTurn]) -> str | None:
+def _find_best_overlap_speaker(start: float, end: float, turns: Iterable[SpeakerTurn]) -> str | None:
     """Find the speaker with the most overlap for a given time range."""
     best_speaker = None
     best_overlap = 0.0
