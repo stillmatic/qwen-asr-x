@@ -53,7 +53,7 @@ def _otsu_threshold(probs: np.ndarray) -> float:
 def get_speech_probs(
     audio: np.ndarray,
     model,
-    window_size_samples: int = 1536,
+    window_size_samples: int = 512,
 ) -> list[float]:
     """Run Silero VAD and return per-window speech probabilities."""
     wav_tensor = torch.from_numpy(audio).float()
@@ -151,7 +151,7 @@ def detect_speech(
     speech_pad_ms: int = 100,
     max_speech_duration_s: float = 30.0,
     merge_gap_s: float = 0.3,
-    window_size_samples: int = 1536,
+    window_size_samples: int = 512,
 ) -> list[SpeechSegment]:
     """Run Silero VAD on 16kHz mono audio and return speech segments.
 
