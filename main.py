@@ -8,7 +8,7 @@ from pipeline import PipelineConfig, run_pipeline
 
 def main():
     parser = argparse.ArgumentParser(
-        description="WhisperX-style ASR pipeline using Qwen3-ASR + Silero VAD"
+        description="WhisperX-style ASR pipeline using Qwen3-ASR (vLLM) + Silero VAD"
     )
     parser.add_argument("audio", help="Input audio file (any ffmpeg-supported format)")
     parser.add_argument(
@@ -28,7 +28,9 @@ def main():
         "--no-align", action="store_true", help="Skip forced alignment"
     )
     parser.add_argument(
-        "--device", default="cuda:0", help="Device (default: cuda:0)"
+        "--device",
+        default="cuda:0",
+        help="Device for aligner/diarization (default: cuda:0)",
     )
     parser.add_argument(
         "--language", default=None, help="Force language (auto-detect if omitted)"
@@ -37,7 +39,13 @@ def main():
         "--batch-size",
         type=int,
         default=4,
-        help="Inference batch size (default: 4)",
+        help="Max ASR inference batch size (default: 4)",
+    )
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.8,
+        help="vLLM GPU memory utilization target (default: 0.8)",
     )
     parser.add_argument(
         "--diarize", action="store_true", help="Enable speaker diarization"
@@ -74,6 +82,7 @@ def main():
         max_speakers=args.max_speakers,
         language=args.language,
         batch_size=args.batch_size,
+        gpu_memory_utilization=args.gpu_memory_utilization,
     )
 
     segments = run_pipeline(args.audio, config)

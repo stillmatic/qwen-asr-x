@@ -27,6 +27,7 @@ class PipelineConfig:
     max_speakers: Optional[int] = None
     language: Optional[str] = None
     batch_size: int = 4
+    gpu_memory_utilization: float = 0.8
     # VAD params
     vad_threshold: float = 0.5
     max_speech_duration_s: float = 30.0
@@ -102,63 +103,65 @@ def run_pipeline(audio_path: str, config: PipelineConfig) -> list[TranscriptSegm
         diarize_future = executor.submit(_run_diarize)
 
     # Load ASR model
-    _log(f"Loading ASR model: {config.model}")
+    _log(f"Loading ASR model (vLLM): {config.model}")
     aligner = config.aligner if config.align else None
-    aligner_kwargs = {"device_map": config.device, "dtype": torch.bfloat16} if aligner else None
-    asr = Qwen3ASRModel.from_pretrained(
-        config.model,
+    aligner_kwargs = None
+    if aligner:
+        aligner_kwargs = {"device_map": config.device, "dtype": torch.bfloat16}
+        if config.hf_token:
+            aligner_kwargs["token"] = config.hf_token
+
+    asr = Qwen3ASRModel.LLM(
+        model=config.model,
         forced_aligner=aligner,
         forced_aligner_kwargs=aligner_kwargs,
         max_inference_batch_size=config.batch_size,
-        device_map=config.device,
-        dtype=torch.bfloat16,
+        max_new_tokens=512,
+        gpu_memory_utilization=config.gpu_memory_utilization,
+        dtype="bfloat16",
+        hf_token=config.hf_token,
     )
     _log("ASR model loaded")
 
-    # Transcribe each VAD segment in batches
+    segment_audio = [
+        (extract_segment_audio(audio, seg), SAMPLE_RATE) for seg in vad_segments
+    ]
+    _log(
+        f"Transcribing {len(vad_segments)} segments via in-process vLLM "
+        f"(max batch {config.batch_size})..."
+    )
+    transcriptions = asr.transcribe(
+        audio=segment_audio,
+        language=config.language,
+        return_time_stamps=config.align,
+    )
+
     results: list[TranscriptSegment] = []
+    for seg, tx in zip(vad_segments, transcriptions):
+        text = (tx.text or "").strip()
+        if not text:
+            continue
 
-    for batch_start in range(0, len(vad_segments), config.batch_size):
-        batch_segs = vad_segments[batch_start : batch_start + config.batch_size]
-        batch_audio = [
-            (extract_segment_audio(audio, seg), SAMPLE_RATE) for seg in batch_segs
-        ]
-
-        _log(
-            f"Transcribing segments {batch_start + 1}-{batch_start + len(batch_segs)}"
-            f"/{len(vad_segments)}"
-        )
-        transcriptions = asr.transcribe(
-            audio=batch_audio,
-            language=config.language,
-            return_time_stamps=config.align,
-        )
-
-        for seg, tx in zip(batch_segs, transcriptions):
-            text = (tx.text or "").strip()
-            if not text:
-                continue
-
-            words = []
-            if config.align and tx.time_stamps is not None:
-                for item in tx.time_stamps:
-                    words.append(
-                        WordSegment(
-                            word=item.text,
-                            start=round(item.start_time + seg.start, 3),
-                            end=round(item.end_time + seg.start, 3),
-                        )
+        words = []
+        if config.align and tx.time_stamps is not None:
+            for item in tx.time_stamps:
+                words.append(
+                    WordSegment(
+                        word=item.text,
+                        start=round(item.start_time + seg.start, 3),
+                        end=round(item.end_time + seg.start, 3),
                     )
-
-            results.append(
-                TranscriptSegment(
-                    start=round(seg.start, 3),
-                    end=round(seg.end, 3),
-                    text=text,
-                    language=tx.language or "",
-                    words=words,
                 )
+
+        results.append(
+            TranscriptSegment(
+                start=round(seg.start, 3),
+                end=round(seg.end, 3),
+                text=text,
+                language=tx.language or "",
+                words=words,
             )
+        )
 
     _log(f"Transcription complete: {len(results)} segments with text")
 
