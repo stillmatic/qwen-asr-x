@@ -67,16 +67,28 @@ pipeline: Pipeline = None
 
 # --- Worker ---
 
+_COHERE_LANG_MAP = {
+    "arabic": "ar", "chinese": "zh", "dutch": "nl", "english": "en",
+    "french": "fr", "german": "de", "greek": "el", "italian": "it",
+    "japanese": "ja", "korean": "ko", "polish": "pl", "portuguese": "pt",
+    "spanish": "es", "vietnamese": "vi",
+}
+
+
 def _process_job(job: Job):
     """Run transcription using the pre-loaded pipeline."""
     job.status = JobStatus.processing
     job.started_at = time.time()
     _log(f"Job {job.job_id}: processing {job.audio_path}")
 
+    language = job.config.get("language")
+    if language and pipeline.config.backend == "cohere":
+        language = _COHERE_LANG_MAP.get(language.lower(), language)
+
     try:
         segments = pipeline.transcribe(
             job.audio_path,
-            language=job.config.get("language"),
+            language=language,
             align=job.config.get("align", True),
             diarize=job.config.get("diarize", False),
             min_speakers=job.config.get("min_speakers"),
@@ -121,7 +133,12 @@ app = FastAPI(title="qwen-asr-x", lifespan=lifespan)
 
 @app.post("/transcribe")
 async def transcribe(req: TranscribeRequest):
+    resolved_audio_path = os.path.abspath(req.audio_path)
     if not os.path.isfile(req.audio_path):
+        _log(
+            "Rejecting /transcribe request: "
+            f"audio_path={req.audio_path!r} resolved_path={resolved_audio_path!r} does not exist"
+        )
         raise HTTPException(status_code=400, detail=f"File not found: {req.audio_path}")
 
     job_id = uuid.uuid4().hex[:12]
@@ -197,28 +214,47 @@ def main():
     parser = argparse.ArgumentParser(description="qwen-asr-x transcription server")
     parser.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=9090, help="Bind port (default: 9090)")
-    parser.add_argument("--model", default="Qwen/Qwen3-ASR-1.7B", help="ASR model")
+    parser.add_argument("--backend", choices=["qwen", "cohere"], default="qwen", help="ASR backend")
+    parser.add_argument("--model", default=None, help="ASR model (default depends on backend)")
     parser.add_argument("--aligner", default="Qwen/Qwen3-ForcedAligner-0.6B", help="Aligner model")
     parser.add_argument("--device", default="cuda:0", help="Device")
     parser.add_argument("--batch-size", type=int, default=4, help="Batch size")
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.8, help="vLLM GPU memory target")
-    parser.add_argument("--hf-token", default=None, help="HF token for diarization")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.8, help="vLLM GPU memory target (qwen only)")
+    parser.add_argument("--hf-token", default=None, help="HF token for gated models")
     parser.add_argument("--diarize", action="store_true", help="Pre-load diarization model")
+    # VAD tuning
+    parser.add_argument("--vad-threshold", default="auto", help="VAD threshold, float or 'auto' (default: auto)")
+    parser.add_argument("--min-speech-duration-ms", type=int, default=50, help="Min speech duration ms (default: 50)")
+    parser.add_argument("--min-silence-duration-ms", type=int, default=100, help="Min silence duration ms (default: 100)")
+    parser.add_argument("--speech-pad-ms", type=int, default=100, help="Speech padding ms (default: 100)")
+    parser.add_argument("--visualize-vad", action="store_true", help="Save VAD debug data to examples/vad/")
     args = parser.parse_args()
 
+    default_models = {
+        "qwen": "Qwen/Qwen3-ASR-1.7B",
+        "cohere": "CohereLabs/cohere-transcribe-03-2026",
+    }
+    model = args.model or default_models[args.backend]
+
     config = PipelineConfig(
-        model=args.model,
+        backend=args.backend,
+        model=model,
         aligner=args.aligner,
         device=args.device,
         batch_size=args.batch_size,
         gpu_memory_utilization=args.gpu_memory_utilization,
         hf_token=args.hf_token or os.environ.get("HF_TOKEN"),
         diarize=args.diarize,
+        vad_threshold=None if args.vad_threshold == "auto" else float(args.vad_threshold),
+        min_speech_duration_ms=args.min_speech_duration_ms,
+        min_silence_duration_ms=args.min_silence_duration_ms,
+        speech_pad_ms=args.speech_pad_ms,
+        visualize_vad=args.visualize_vad,
     )
 
     # Load all models once at startup
     global pipeline
-    _log(f"Initializing pipeline: {args.model}")
+    _log(f"Initializing pipeline: {model} ({args.backend})")
     pipeline = Pipeline(config)
 
     _log(f"Starting server on {args.host}:{args.port}")

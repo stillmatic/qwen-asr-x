@@ -85,6 +85,9 @@ Submit an audio file for transcription. Returns immediately with a job ID.
 
 ### `GET /jobs/{job_id}` — Poll Job Status
 
+Completion is indicated by the string field `status` becoming `"done"`.
+The transcript payload is returned in `result`. The server does not return `done: true` or `segments: [...]`.
+
 **Response when queued:**
 
 ```json
@@ -210,6 +213,8 @@ Jobs are processed sequentially in FIFO order (one at a time on the GPU). If you
 ## Integration Examples
 
 ### Go
+
+The polling response maps to `status` and `result`, so your Go struct should use `Status string` and `Result []Segment`.
 
 ```go
 package main
