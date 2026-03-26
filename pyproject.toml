@@ -1,0 +1,11 @@
+[project]
+name = "qwen-asr-x"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "pyannote-audio>=4.0.4",
+    "qwen-asr[vllm]>=0.0.6",
+    "silero-vad>=6.2.1",
+]
