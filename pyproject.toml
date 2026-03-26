@@ -5,7 +5,9 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "fastapi>=0.135.2",
     "pyannote-audio>=4.0.4",
     "qwen-asr[vllm]>=0.0.6",
     "silero-vad>=6.2.1",
+    "uvicorn>=0.42.0",
 ]

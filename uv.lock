@@ -3755,16 +3755,20 @@ name = "qwen-asr-x"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "fastapi" },
     { name = "pyannote-audio" },
     { name = "qwen-asr", extra = ["vllm"] },
     { name = "silero-vad" },
+    { name = "uvicorn" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "fastapi", specifier = ">=0.135.2" },
     { name = "pyannote-audio", specifier = ">=4.0.4" },
     { name = "qwen-asr", extras = ["vllm"], specifier = ">=0.0.6" },
     { name = "silero-vad", specifier = ">=6.2.1" },
+    { name = "uvicorn", specifier = ">=0.42.0" },
 ]
 
 [[package]]
