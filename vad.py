@@ -14,24 +14,38 @@ class SpeechSegment:
     end: float  # seconds
 
 
+@dataclass
+class VadResult:
+    segments: list[SpeechSegment]
+    params: dict  # the actual params used (threshold, min_speech_duration_ms, etc.)
+
+
 def load_vad_model():
     return load_silero_vad()
 
 
-def _otsu_threshold(probs: np.ndarray) -> float:
-    """Find optimal threshold to separate speech/non-speech using Otsu's method."""
-    nbins = 256
-    hist, bin_edges = np.histogram(probs, bins=nbins, range=(0.0, 1.0))
+@dataclass
+class AutoVadParams:
+    threshold: float
+    min_speech_duration_ms: int
+    min_silence_duration_ms: int
+    merge_gap_s: float
+    speech_pad_ms: int = 80
+
+
+def _otsu(values: np.ndarray, nbins: int = 256, lo: float = 0.0, hi: float = 1.0) -> float:
+    """Otsu's method: find threshold that best separates a bimodal distribution."""
+    hist, bin_edges = np.histogram(values, bins=nbins, range=(lo, hi))
     bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
     total = hist.sum()
     if total == 0:
-        return 0.5
+        return (lo + hi) / 2
 
     cum_sum = np.cumsum(hist)
     cum_mean = np.cumsum(hist * bin_centers)
     global_mean = cum_mean[-1]
 
-    best_thresh = 0.5
+    best_thresh = (lo + hi) / 2
     best_variance = -1.0
 
     for i in range(nbins - 1):
@@ -47,6 +61,80 @@ def _otsu_threshold(probs: np.ndarray) -> float:
             best_thresh = bin_centers[i]
 
     return float(best_thresh)
+
+
+def _auto_vad_params(
+    probs: list[float],
+    window_size_samples: int,
+) -> AutoVadParams:
+    """Derive all VAD params from the probability curve."""
+    prob_arr = np.array(probs)
+    window_ms = window_size_samples / SAMPLE_RATE * 1000
+
+    # 1. Threshold: find where the silence cluster ends.
+    #    Otsu tends to pick too high when silence dominates. Instead:
+    #    - Find the silence peak (mode of values < 0.5)
+    #    - Set threshold at silence_peak + 3*sigma of the silence cluster
+    #    - Fall back to Otsu if the distribution is unusual
+    silence_probs = prob_arr[prob_arr < 0.5]
+    if len(silence_probs) > 10:
+        silence_mean = float(np.mean(silence_probs))
+        silence_std = float(np.std(silence_probs))
+        # Threshold just above the silence noise floor
+        threshold = silence_mean + max(3 * silence_std, 0.05)
+        threshold = max(0.05, min(0.5, threshold))
+    else:
+        # Very little silence — fall back to Otsu
+        threshold = _otsu(prob_arr)
+        threshold = max(0.05, min(0.95, threshold))
+
+    # 2. Find raw above-threshold regions (no duration filtering yet)
+    above = prob_arr >= threshold
+    regions: list[tuple[int, int]] = []  # (start_idx, end_idx)
+    in_region = False
+    start = 0
+    for i, v in enumerate(above):
+        if v and not in_region:
+            in_region = True
+            start = i
+        elif not v and in_region:
+            regions.append((start, i))
+            in_region = False
+    if in_region:
+        regions.append((start, len(above)))
+
+    # 3. Compute gap durations and speech durations in ms
+    speech_durations = np.array([(e - s) * window_ms for s, e in regions])
+    gaps = np.array([
+        (regions[i + 1][0] - regions[i][1]) * window_ms
+        for i in range(len(regions) - 1)
+    ]) if len(regions) > 1 else np.array([])
+
+    # 4. min_silence_duration: Otsu on gap durations
+    #    Separates intra-utterance pauses from real silence breaks
+    if len(gaps) >= 3:
+        gap_split = _otsu(gaps, nbins=64, lo=float(gaps.min()), hi=float(gaps.max()))
+        min_silence_ms = int(max(50, min(gap_split, 1000)))
+    else:
+        min_silence_ms = 100
+
+    # 5. min_speech_duration: filter noise bursts
+    #    Use 10th percentile of speech durations as noise floor
+    if len(speech_durations) >= 5:
+        min_speech_ms = int(max(30, np.percentile(speech_durations, 10)))
+    else:
+        min_speech_ms = 50
+
+    # 6. merge_gap: slightly above min_silence to bridge stutters
+    merge_gap_s = round(min_silence_ms / 1000 * 1.5, 2)
+    merge_gap_s = max(0.1, min(merge_gap_s, 2.0))
+
+    return AutoVadParams(
+        threshold=threshold,
+        min_speech_duration_ms=min_speech_ms,
+        min_silence_duration_ms=min_silence_ms,
+        merge_gap_s=merge_gap_s,
+    )
 
 
 @torch.no_grad()
@@ -152,20 +240,30 @@ def detect_speech(
     max_speech_duration_s: float = 30.0,
     merge_gap_s: float = 0.3,
     window_size_samples: int = 512,
-) -> list[SpeechSegment]:
+) -> VadResult:
     """Run Silero VAD on 16kHz mono audio and return speech segments.
 
-    threshold: Speech probability threshold. None means auto (Otsu's method).
-    window_size_samples: 512 (32ms, most precise) or 1536 (96ms, 3x faster).
+    threshold: Speech probability threshold. None means auto (Otsu's method),
+               which also auto-derives min_speech, min_silence, pad, and merge_gap.
     """
     if threshold is None:
-        # Auto mode: collect probs, pick threshold via Otsu, segment from probs
+        # Auto mode: derive all params from the probability curve
         import sys
         probs = get_speech_probs(audio, model, window_size_samples)
-        threshold = _otsu_threshold(np.array(probs))
-        # Clamp to reasonable range
-        threshold = max(0.05, min(0.95, threshold))
-        print(f"[VAD] auto threshold (Otsu): {threshold:.3f}", file=sys.stderr)
+        auto = _auto_vad_params(probs, window_size_samples)
+        threshold = auto.threshold
+        min_speech_duration_ms = auto.min_speech_duration_ms
+        min_silence_duration_ms = auto.min_silence_duration_ms
+        speech_pad_ms = auto.speech_pad_ms
+        merge_gap_s = auto.merge_gap_s
+        print(
+            f"[VAD] auto params — threshold: {threshold:.3f}, "
+            f"min_speech: {min_speech_duration_ms}ms, "
+            f"min_silence: {min_silence_duration_ms}ms, "
+            f"pad: {speech_pad_ms}ms, "
+            f"merge_gap: {merge_gap_s}s",
+            file=sys.stderr,
+        )
 
         segments = _segment_from_probs(
             probs,
@@ -201,7 +299,17 @@ def detect_speech(
     if merge_gap_s > 0:
         segments = _merge_close_segments(segments, merge_gap_s)
 
-    return segments
+    return VadResult(
+        segments=segments,
+        params={
+            "threshold": round(threshold, 4),
+            "min_speech_duration_ms": min_speech_duration_ms,
+            "min_silence_duration_ms": min_silence_duration_ms,
+            "speech_pad_ms": speech_pad_ms,
+            "max_speech_duration_s": max_speech_duration_s,
+            "merge_gap_s": merge_gap_s,
+        },
+    )
 
 
 def _merge_close_segments(

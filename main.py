@@ -74,15 +74,15 @@ def main():
     )
     # VAD tuning
     parser.add_argument(
-        "--vad-threshold", default="auto", help="VAD threshold, float or 'auto' (default: auto)"
+        "--vad-threshold", type=float, default=0.2, help="VAD threshold (default: 0.2)"
     )
     parser.add_argument(
-        "--min-speech-duration-ms", type=int, default=50,
-        help="Min speech duration in ms (default: 50)",
+        "--min-speech-duration-ms", type=int, default=250,
+        help="Min speech duration in ms (default: 250)",
     )
     parser.add_argument(
-        "--min-silence-duration-ms", type=int, default=100,
-        help="Min silence duration in ms (default: 100)",
+        "--min-silence-duration-ms", type=int, default=200,
+        help="Min silence duration in ms (default: 200)",
     )
     parser.add_argument(
         "--speech-pad-ms", type=int, default=100,
@@ -119,7 +119,7 @@ def main():
         language=args.language,
         batch_size=args.batch_size,
         gpu_memory_utilization=args.gpu_memory_utilization,
-        vad_threshold=None if args.vad_threshold == "auto" else float(args.vad_threshold),
+        vad_threshold=args.vad_threshold,
         min_speech_duration_ms=args.min_speech_duration_ms,
         min_silence_duration_ms=args.min_silence_duration_ms,
         speech_pad_ms=args.speech_pad_ms,

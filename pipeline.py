@@ -37,9 +37,9 @@ class PipelineConfig:
     batch_size: int = 4
     gpu_memory_utilization: float = 0.8
     # VAD params
-    vad_threshold: Optional[float] = None  # None = auto (Otsu's method)
-    min_speech_duration_ms: int = 50
-    min_silence_duration_ms: int = 100
+    vad_threshold: float = 0.2
+    min_speech_duration_ms: int = 250
+    min_silence_duration_ms: int = 200
     speech_pad_ms: int = 100
     max_speech_duration_s: float = 30.0
     merge_gap_s: float = 0.3
@@ -156,8 +156,8 @@ class Pipeline:
 
         # VAD
         thresh = self.config.vad_threshold
-        _log(f"Running VAD (threshold={'auto' if thresh is None else thresh})...")
-        vad_segments = detect_speech(
+        _log(f"Running VAD (threshold={thresh})...")
+        vad_result = detect_speech(
             audio,
             self.vad_model,
             threshold=thresh,
@@ -167,10 +167,11 @@ class Pipeline:
             max_speech_duration_s=self.config.max_speech_duration_s,
             merge_gap_s=self.config.merge_gap_s,
         )
+        vad_segments = vad_result.segments
         _log(f"VAD found {len(vad_segments)} speech segments")
 
         if self.config.visualize_vad:
-            self._save_vad_debug(audio_path, audio, vad_segments)
+            self._save_vad_debug(audio_path, audio, vad_segments, vad_result.params)
 
         if not vad_segments:
             _log("No speech detected")
@@ -268,7 +269,7 @@ class Pipeline:
                 diarize_executor.shutdown(wait=True)
 
 
-    def _save_vad_debug(self, audio_path: str, audio: np.ndarray, vad_segments):
+    def _save_vad_debug(self, audio_path: str, audio: np.ndarray, vad_segments, vad_params: dict):
         """Save VAD probabilities and segments to examples/vad/{stem}/."""
         import json
         from pathlib import Path
@@ -277,23 +278,16 @@ class Pipeline:
         out_dir = Path("examples/vad") / stem
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        _log(f"Computing VAD probabilities for debug...")
+        _log("Computing VAD probabilities for debug...")
         probs = get_speech_probs(audio, self.vad_model)
         duration = len(audio) / SAMPLE_RATE
-        window_sec = 512 / SAMPLE_RATE  # silero default window
+        window_sec = 512 / SAMPLE_RATE
 
         data = {
             "audio_path": audio_path,
             "duration": round(duration, 3),
             "sample_rate": SAMPLE_RATE,
-            "vad_params": {
-                "threshold": self.config.vad_threshold,
-                "min_speech_duration_ms": self.config.min_speech_duration_ms,
-                "min_silence_duration_ms": self.config.min_silence_duration_ms,
-                "speech_pad_ms": self.config.speech_pad_ms,
-                "max_speech_duration_s": self.config.max_speech_duration_s,
-                "merge_gap_s": self.config.merge_gap_s,
-            },
+            "vad_params": vad_params,
             "probs": {
                 "window_sec": round(window_sec, 6),
                 "values": [round(p, 4) for p in probs],

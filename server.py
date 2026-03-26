@@ -223,9 +223,9 @@ def main():
     parser.add_argument("--hf-token", default=None, help="HF token for gated models")
     parser.add_argument("--diarize", action="store_true", help="Pre-load diarization model")
     # VAD tuning
-    parser.add_argument("--vad-threshold", default="auto", help="VAD threshold, float or 'auto' (default: auto)")
-    parser.add_argument("--min-speech-duration-ms", type=int, default=50, help="Min speech duration ms (default: 50)")
-    parser.add_argument("--min-silence-duration-ms", type=int, default=100, help="Min silence duration ms (default: 100)")
+    parser.add_argument("--vad-threshold", type=float, default=0.2, help="VAD threshold (default: 0.2)")
+    parser.add_argument("--min-speech-duration-ms", type=int, default=250, help="Min speech duration ms (default: 250)")
+    parser.add_argument("--min-silence-duration-ms", type=int, default=200, help="Min silence duration ms (default: 200)")
     parser.add_argument("--speech-pad-ms", type=int, default=100, help="Speech padding ms (default: 100)")
     parser.add_argument("--visualize-vad", action="store_true", help="Save VAD debug data to examples/vad/")
     args = parser.parse_args()
@@ -245,7 +245,7 @@ def main():
         gpu_memory_utilization=args.gpu_memory_utilization,
         hf_token=args.hf_token or os.environ.get("HF_TOKEN"),
         diarize=args.diarize,
-        vad_threshold=None if args.vad_threshold == "auto" else float(args.vad_threshold),
+        vad_threshold=args.vad_threshold,
         min_speech_duration_ms=args.min_speech_duration_ms,
         min_silence_duration_ms=args.min_silence_duration_ms,
         speech_pad_ms=args.speech_pad_ms,
