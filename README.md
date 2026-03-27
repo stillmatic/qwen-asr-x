@@ -1,6 +1,6 @@
 # qwen-asr-x
 
-WhisperX-style speech transcription pipeline using [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) and [Silero VAD](https://github.com/snakers4/silero-vad).
+Speech transcription pipeline using [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) and [Silero VAD](https://github.com/snakers4/silero-vad). Inspired by [WhisperX](https://github.com/m-bain/whisperx).
 
 Takes any audio format (via ffmpeg) and produces transcripts with word-level timestamps, automatic language detection, and optional speaker diarization.
 
