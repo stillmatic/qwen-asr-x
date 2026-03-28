@@ -14,11 +14,26 @@ from asr_backend import create_backend
 from output import TranscriptSegment, WordSegment
 from vad import (
     SAMPLE_RATE,
+    SpeechSegment,
     detect_speech,
     extract_segment_audio,
     get_speech_probs,
     load_vad_model,
 )
+
+
+@dataclass
+class PreparedJob:
+    """Output of the VAD stage, input to the ASR stage."""
+    audio: np.ndarray
+    vad_segments: list[SpeechSegment]
+    vad_params: dict
+    audio_path: str
+    language: Optional[str]
+    align: bool
+    diarize: bool
+    min_speakers: Optional[int]
+    max_speakers: Optional[int]
 
 
 @dataclass
@@ -133,17 +148,23 @@ class Pipeline:
 
         _log("All models loaded")
 
-    def transcribe(
+    def prepare(
         self,
         audio_path: str,
         *,
+        vad_model=None,
         language: Optional[str] = None,
         align: Optional[bool] = None,
         diarize: Optional[bool] = None,
         min_speakers: Optional[int] = None,
         max_speakers: Optional[int] = None,
-    ) -> list[TranscriptSegment]:
-        """Run VAD -> ASR -> alignment -> diarization on a single audio file."""
+    ) -> PreparedJob:
+        """Stage 1: Load audio and run VAD (CPU-bound).
+
+        vad_model: Optional separate Silero model instance for thread safety.
+                   Falls back to self.vad_model if not provided.
+        """
+        model = vad_model or self.vad_model
         if align is None:
             align = self.config.align
         if diarize is None:
@@ -159,7 +180,7 @@ class Pipeline:
         _log(f"Running VAD (threshold={thresh})...")
         vad_result = detect_speech(
             audio,
-            self.vad_model,
+            model,
             threshold=thresh,
             min_speech_duration_ms=self.config.min_speech_duration_ms,
             min_silence_duration_ms=self.config.min_silence_duration_ms,
@@ -167,119 +188,200 @@ class Pipeline:
             max_speech_duration_s=self.config.max_speech_duration_s,
             merge_gap_s=self.config.merge_gap_s,
         )
-        vad_segments = vad_result.segments
-        _log(f"VAD found {len(vad_segments)} speech segments")
+        _log(f"VAD found {len(vad_result.segments)} speech segments")
 
         if self.config.visualize_vad:
-            self._save_vad_debug(audio_path, audio, vad_segments, vad_result.params)
+            self._save_vad_debug(audio_path, audio, vad_result.segments, vad_result.params, vad_model=model)
 
-        if not vad_segments:
-            _log("No speech detected")
-            return []
+        return PreparedJob(
+            audio=audio,
+            vad_segments=vad_result.segments,
+            vad_params=vad_result.params,
+            audio_path=audio_path,
+            language=language or self.config.language,
+            align=align,
+            diarize=diarize,
+            min_speakers=min_speakers or self.config.min_speakers,
+            max_speakers=max_speakers or self.config.max_speakers,
+        )
 
-        # Kick off diarization in background
+    def run_asr(self, prepared: PreparedJob) -> list[TranscriptSegment]:
+        """Stage 2: ASR + alignment + diarization for a single job (GPU-bound)."""
+        return self.run_asr_batch([prepared])[0]
+
+    def run_asr_batch(self, jobs: list[PreparedJob]) -> list[list[TranscriptSegment]]:
+        """Stage 2: ASR + alignment + diarization across multiple jobs in one batch.
+
+        Merges segments from all jobs into single ASR and alignment calls for
+        better GPU utilization, then demuxes results back per-job.
+        """
+        # Build merged segment list with per-job boundaries
+        all_audio_segments: list[tuple[np.ndarray, int]] = []
+        # job_slices[i] = (start_idx, end_idx) into all_audio_segments
+        job_slices: list[tuple[int, int]] = []
+        for job in jobs:
+            start = len(all_audio_segments)
+            for seg in job.vad_segments:
+                all_audio_segments.append((extract_segment_audio(job.audio, seg), SAMPLE_RATE))
+            job_slices.append((start, len(all_audio_segments)))
+
+        total_segs = len(all_audio_segments)
+        _log(f"Batch ASR: {total_segs} segments from {len(jobs)} jobs")
+
+        # Group segments by language for ASR calls
+        lang_to_seg_indices: dict[Optional[str], list[int]] = {}
+        for job_idx, job in enumerate(jobs):
+            seg_start, seg_end = job_slices[job_idx]
+            lang_to_seg_indices.setdefault(job.language, []).extend(range(seg_start, seg_end))
+
+        # Run ASR per language group
+        all_asr_results = [None] * total_segs
+        for lang, seg_indices in lang_to_seg_indices.items():
+            group_audio = [all_audio_segments[i] for i in seg_indices]
+            if not group_audio:
+                continue
+            group_results = self.asr.transcribe(audio=group_audio, language=lang)
+            for si, result in zip(seg_indices, group_results):
+                all_asr_results[si] = result
+
+        # Forced alignment in one batch (aligner handles per-segment language)
+        all_align_results = [None] * total_segs
+        any_align = any(job.align for job in jobs)
+        if any_align and self.aligner:
+            to_align = []
+            for i in range(total_segs):
+                if all_asr_results[i] is None or not all_asr_results[i].text.strip():
+                    continue
+                job_idx = next(ji for ji, (s, e) in enumerate(job_slices) if s <= i < e)
+                if jobs[job_idx].align:
+                    to_align.append((i, all_audio_segments[i], all_asr_results[i]))
+
+            if to_align:
+                _log(f"Batch align: {len(to_align)} segments")
+                aligned = self.aligner.align(
+                    audio=[sa for _, sa, _ in to_align],
+                    text=[r.text for _, _, r in to_align],
+                    language=[r.language or "English" for _, _, r in to_align],
+                )
+                for (i, _, _), ar in zip(to_align, aligned):
+                    all_align_results[i] = ar
+
+        # Diarization runs per-job in background threads
         diarize_executor = None
-        diarize_future = None
+        diarize_futures: dict[int, object] = {}
         try:
-            if diarize and self.diar_pipeline:
+            diarize_jobs = [
+                (i, job) for i, job in enumerate(jobs) if job.diarize and self.diar_pipeline
+            ]
+            if diarize_jobs:
                 from diarize import run_diarization
 
-                def _run_diarize():
-                    _log("Running diarization (background)...")
-                    turns = run_diarization(
-                        audio,
-                        self.diar_pipeline,
-                        min_speakers=min_speakers or self.config.min_speakers,
-                        max_speakers=max_speakers or self.config.max_speakers,
+                diarize_executor = ThreadPoolExecutor(max_workers=len(diarize_jobs))
+                for i, job in diarize_jobs:
+                    def _run(j=job):
+                        _log("Running diarization (background)...")
+                        turns = run_diarization(
+                            j.audio,
+                            self.diar_pipeline,
+                            min_speakers=j.min_speakers,
+                            max_speakers=j.max_speakers,
+                        )
+                        _log(f"Diarization complete: {len(set(t.speaker for t in turns))} speakers")
+                        return turns
+                    diarize_futures[i] = diarize_executor.submit(_run)
+
+            # Demux results per job
+            per_job_results: list[list[TranscriptSegment]] = []
+            for job_idx, job in enumerate(jobs):
+                seg_start, seg_end = job_slices[job_idx]
+                results: list[TranscriptSegment] = []
+                for seg_i, global_i in enumerate(range(seg_start, seg_end)):
+                    asr_r = all_asr_results[global_i]
+                    if asr_r is None:
+                        continue
+                    text = asr_r.text.strip()
+                    if not text:
+                        continue
+
+                    ar = all_align_results[global_i]
+                    seg = job.vad_segments[seg_i]
+                    words = []
+                    if ar is not None:
+                        for item in ar:
+                            words.append(
+                                WordSegment(
+                                    word=item.text,
+                                    start=round(item.start_time + seg.start, 3),
+                                    end=round(item.end_time + seg.start, 3),
+                                )
+                            )
+
+                    results.append(
+                        TranscriptSegment(
+                            start=round(seg.start, 3),
+                            end=round(seg.end, 3),
+                            text=text,
+                            language=asr_r.language,
+                            words=words,
+                        )
                     )
-                    _log(f"Diarization complete: {len(set(t.speaker for t in turns))} speakers")
-                    return turns
+                per_job_results.append(results)
 
-                diarize_executor = ThreadPoolExecutor(max_workers=1)
-                diarize_future = diarize_executor.submit(_run_diarize)
-
-            # ASR
-            segment_audio = [
-                (extract_segment_audio(audio, seg), SAMPLE_RATE) for seg in vad_segments
-            ]
-            _log(f"Transcribing {len(vad_segments)} segments...")
-            asr_results = self.asr.transcribe(
-                audio=segment_audio,
-                language=language or self.config.language,
+            _log(
+                f"Batch complete: {len(jobs)} jobs, "
+                f"{sum(len(r) for r in per_job_results)} total segments with text"
             )
 
-            # Forced alignment (shared across all backends)
-            align_results = [None] * len(asr_results)
-            if align and self.aligner:
-                to_align = [
-                    (i, segment_audio[i], r)
-                    for i, r in enumerate(asr_results)
-                    if r.text.strip()
-                ]
-                if to_align:
-                    _log(f"Aligning {len(to_align)} segments...")
-                    aligned = self.aligner.align(
-                        audio=[sa for _, sa, _ in to_align],
-                        text=[r.text for _, _, r in to_align],
-                        language=[r.language or "English" for _, _, r in to_align],
-                    )
-                    for (i, _, _), ar in zip(to_align, aligned):
-                        align_results[i] = ar
-
-            # Build results
-            results: list[TranscriptSegment] = []
-            for seg, asr_r, ar in zip(vad_segments, asr_results, align_results):
-                text = asr_r.text.strip()
-                if not text:
-                    continue
-
-                words = []
-                if ar is not None:
-                    for item in ar:
-                        words.append(
-                            WordSegment(
-                                word=item.text,
-                                start=round(item.start_time + seg.start, 3),
-                                end=round(item.end_time + seg.start, 3),
-                            )
-                        )
-
-                results.append(
-                    TranscriptSegment(
-                        start=round(seg.start, 3),
-                        end=round(seg.end, 3),
-                        text=text,
-                        language=asr_r.language,
-                        words=words,
-                    )
-                )
-
-            _log(f"Transcription complete: {len(results)} segments with text")
-
-            # Wait for diarization
-            if diarize_future is not None:
+            # Apply diarization
+            if diarize_futures:
                 from diarize import assign_speakers
 
-                turns = diarize_future.result()
-                results = assign_speakers(results, turns)
+                for i, future in diarize_futures.items():
+                    turns = future.result()
+                    per_job_results[i] = assign_speakers(per_job_results[i], turns)
 
-            return results
+            return per_job_results
         finally:
             if diarize_executor is not None:
                 diarize_executor.shutdown(wait=True)
 
+    def transcribe(
+        self,
+        audio_path: str,
+        *,
+        language: Optional[str] = None,
+        align: Optional[bool] = None,
+        diarize: Optional[bool] = None,
+        min_speakers: Optional[int] = None,
+        max_speakers: Optional[int] = None,
+    ) -> list[TranscriptSegment]:
+        """Run VAD -> ASR -> alignment -> diarization on a single audio file."""
+        prepared = self.prepare(
+            audio_path,
+            language=language,
+            align=align,
+            diarize=diarize,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+        )
+        if not prepared.vad_segments:
+            _log("No speech detected")
+            return []
+        return self.run_asr(prepared)
 
-    def _save_vad_debug(self, audio_path: str, audio: np.ndarray, vad_segments, vad_params: dict):
+
+    def _save_vad_debug(self, audio_path: str, audio: np.ndarray, vad_segments, vad_params: dict, *, vad_model=None):
         """Save VAD probabilities and segments to examples/vad/{stem}/."""
         import json
         from pathlib import Path
 
+        model = vad_model or self.vad_model
         stem = Path(audio_path).stem
         out_dir = Path("examples/vad") / stem
         out_dir.mkdir(parents=True, exist_ok=True)
 
         _log("Computing VAD probabilities for debug...")
-        probs = get_speech_probs(audio, self.vad_model)
+        probs = get_speech_probs(audio, model)
         duration = len(audio) / SAMPLE_RATE
         window_sec = 512 / SAMPLE_RATE
 

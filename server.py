@@ -24,7 +24,8 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from pipeline import Pipeline, PipelineConfig, _log
+from pipeline import Pipeline, PipelineConfig, PreparedJob, _log
+from vad import load_vad_model
 
 
 # --- Models ---
@@ -46,7 +47,9 @@ class Job:
         self.error = None
         self.created_at = time.time()
         self.started_at = None
+        self.vad_finished_at = None
         self.finished_at = None
+        self._prepared: PreparedJob | None = None
 
 
 class TranscribeRequest(BaseModel):
@@ -62,7 +65,9 @@ class TranscribeRequest(BaseModel):
 
 jobs: dict[str, Job] = {}
 job_queue: asyncio.Queue = None
+asr_queue: asyncio.Queue = None
 pipeline: Pipeline = None
+vad_models: list = []
 
 
 # --- Worker ---
@@ -75,56 +80,110 @@ _COHERE_LANG_MAP = {
 }
 
 
-def _process_job(job: Job):
-    """Run transcription using the pre-loaded pipeline."""
+def _prepare_job(job: Job, vad_model):
+    """Stage 1: Load audio + VAD (CPU-bound)."""
     job.status = JobStatus.processing
     job.started_at = time.time()
-    _log(f"Job {job.job_id}: processing {job.audio_path}")
+    _log(f"Job {job.job_id}: VAD stage - {job.audio_path}")
 
     language = job.config.get("language")
     if language and pipeline.config.backend == "cohere":
         language = _COHERE_LANG_MAP.get(language.lower(), language)
 
-    try:
-        segments = pipeline.transcribe(
-            job.audio_path,
-            language=language,
-            align=job.config.get("align", True),
-            diarize=job.config.get("diarize", False),
-            min_speakers=job.config.get("min_speakers"),
-            max_speakers=job.config.get("max_speakers"),
-        )
-        job.result = [asdict(s) for s in segments]
+    job._prepared = pipeline.prepare(
+        job.audio_path,
+        vad_model=vad_model,
+        language=language,
+        align=job.config.get("align", True),
+        diarize=job.config.get("diarize", False),
+        min_speakers=job.config.get("min_speakers"),
+        max_speakers=job.config.get("max_speakers"),
+    )
+    job.vad_finished_at = time.time()
+    _log(f"Job {job.job_id}: VAD done ({len(job._prepared.vad_segments)} segments)")
+
+
+def _run_asr_batch(batch: list[Job]):
+    """Stage 2: Batched ASR + alignment + diarization (GPU-bound)."""
+    job_ids = ", ".join(j.job_id for j in batch)
+    _log(f"ASR batch: {len(batch)} jobs [{job_ids}]")
+    prepared = [job._prepared for job in batch]
+    results_per_job = pipeline.run_asr_batch(prepared)
+    now = time.time()
+    for job, result in zip(batch, results_per_job):
+        job.result = [asdict(s) for s in result]
         job.status = JobStatus.done
-        _log(f"Job {job.job_id}: done ({len(segments)} segments)")
-    except Exception as e:
-        job.status = JobStatus.error
-        job.error = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
-        _log(f"Job {job.job_id}: error - {e}")
-    finally:
-        job.finished_at = time.time()
+        job.finished_at = now
+        job._prepared = None  # free audio array
+        _log(f"Job {job.job_id}: done ({len(result)} segments)")
 
 
-async def _worker():
-    """Process jobs from the queue one at a time."""
+async def _vad_worker(vad_model):
+    """Pull jobs from job_queue, run VAD, push to asr_queue."""
     loop = asyncio.get_event_loop()
     while True:
         job = await job_queue.get()
         try:
-            await loop.run_in_executor(None, _process_job, job)
-        except Exception:
-            pass
-        job_queue.task_done()
+            await loop.run_in_executor(None, _prepare_job, job, vad_model)
+            if not job._prepared.vad_segments:
+                # No speech detected — complete immediately
+                job.result = []
+                job.status = JobStatus.done
+                job.finished_at = time.time()
+                job._prepared = None
+                _log(f"Job {job.job_id}: no speech detected")
+            else:
+                await asr_queue.put(job)
+        except Exception as e:
+            job.status = JobStatus.error
+            job.error = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+            job.finished_at = time.time()
+            job._prepared = None
+            _log(f"Job {job.job_id}: error in VAD stage - {e}")
+        finally:
+            job_queue.task_done()
+
+
+async def _asr_worker():
+    """Drain asr_queue and run batched ASR across all ready jobs."""
+    loop = asyncio.get_event_loop()
+    while True:
+        # Wait for at least one job
+        job = await asr_queue.get()
+        batch = [job]
+        # Drain any additional ready jobs (non-blocking)
+        while not asr_queue.empty():
+            try:
+                batch.append(asr_queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        try:
+            await loop.run_in_executor(None, _run_asr_batch, batch)
+        except Exception as e:
+            tb = traceback.format_exc()
+            for j in batch:
+                j.status = JobStatus.error
+                j.error = f"{type(e).__name__}: {e}\n{tb}"
+                j.finished_at = time.time()
+                j._prepared = None
+            _log(f"ASR batch error ({len(batch)} jobs): {e}")
+        finally:
+            for _ in batch:
+                asr_queue.task_done()
 
 
 # --- App ---
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global job_queue
+    global job_queue, asr_queue
+    n_vad = len(vad_models)
     job_queue = asyncio.Queue()
-    asyncio.create_task(_worker())
-    _log("Worker started, ready to accept jobs")
+    asr_queue = asyncio.Queue(maxsize=n_vad)
+    for model in vad_models:
+        asyncio.create_task(_vad_worker(model))
+    asyncio.create_task(_asr_worker())
+    _log(f"Workers started ({n_vad} VAD + 1 ASR batcher), ready to accept jobs")
     yield
 
 
@@ -175,6 +234,7 @@ async def get_job(job_id: str):
         "audio_path": job.audio_path,
         "created_at": job.created_at,
         "started_at": job.started_at,
+        "vad_finished_at": job.vad_finished_at,
         "finished_at": job.finished_at,
     }
     if job.status == JobStatus.done:
@@ -228,6 +288,7 @@ def main():
     parser.add_argument("--min-silence-duration-ms", type=int, default=200, help="Min silence duration ms (default: 200)")
     parser.add_argument("--speech-pad-ms", type=int, default=100, help="Speech padding ms (default: 100)")
     parser.add_argument("--visualize-vad", action="store_true", help="Save VAD debug data to examples/vad/")
+    parser.add_argument("--vad-workers", type=int, default=2, help="Number of parallel VAD workers (default: 2)")
     args = parser.parse_args()
 
     default_models = {
@@ -253,9 +314,14 @@ def main():
     )
 
     # Load all models once at startup
-    global pipeline
+    global pipeline, vad_models
     _log(f"Initializing pipeline: {model} ({args.backend})")
     pipeline = Pipeline(config)
+
+    # Load extra VAD models for parallel workers (Pipeline already loaded one)
+    n_vad = max(1, args.vad_workers)
+    _log(f"Loading {n_vad} VAD model(s) for parallel workers...")
+    vad_models = [load_vad_model() for _ in range(n_vad)]
 
     _log(f"Starting server on {args.host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port)

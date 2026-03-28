@@ -97,6 +97,7 @@ The transcript payload is returned in `result`. The server does not return `done
   "audio_path": "/path/to/audio.mp3",
   "created_at": 1711440000.0,
   "started_at": null,
+  "vad_finished_at": null,
   "finished_at": null
 }
 ```
@@ -110,6 +111,7 @@ The transcript payload is returned in `result`. The server does not return `done
   "audio_path": "/path/to/audio.mp3",
   "created_at": 1711440000.0,
   "started_at": 1711440005.0,
+  "vad_finished_at": null,
   "finished_at": null
 }
 ```
@@ -123,6 +125,7 @@ The transcript payload is returned in `result`. The server does not return `done
   "audio_path": "/path/to/audio.mp3",
   "created_at": 1711440000.0,
   "started_at": 1711440005.0,
+  "vad_finished_at": 1711440018.0,
   "finished_at": 1711440079.0,
   "result": [
     {
@@ -149,6 +152,7 @@ The transcript payload is returned in `result`. The server does not return `done
   "audio_path": "/path/to/audio.mp3",
   "created_at": 1711440000.0,
   "started_at": 1711440005.0,
+  "vad_finished_at": null,
   "finished_at": 1711440006.0,
   "error": "FileNotFoundError: ..."
 }
@@ -406,8 +410,9 @@ Each word in the `words` array:
 
 ## Architecture Notes
 
+- **Two-stage pipeline** — VAD (CPU-bound) and ASR (GPU-bound) run as separate workers. When multiple jobs are queued, the next job's VAD runs on CPU while the current job's ASR runs on GPU, improving throughput.
 - **Job queue is in-process** — jobs are stored in memory and lost on restart. For persistence, implement a database-backed queue upstream.
-- **One job at a time** — the GPU processes jobs sequentially. Submitting multiple jobs queues them in FIFO order.
+- **One ASR job at a time** — the GPU processes jobs sequentially. VAD for the next job can overlap with the current job's ASR.
 - **Models stay warm** — VAD, ASR (vLLM), aligner, and diarization models are loaded once at server startup. Subsequent jobs skip the ~50s initialization.
 - **Audio must be on the local filesystem** — the server reads files by path. If your client is remote, upload the file first (e.g. to a shared volume or temp directory) and pass the path.
 - **Diarization is optional** — pass `--diarize` at server startup to pre-load the model. Per-job `"diarize": true` only works if the server was started with diarization enabled.
