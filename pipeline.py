@@ -50,13 +50,14 @@ class PipelineConfig:
     max_speakers: Optional[int] = None
     language: Optional[str] = None
     batch_size: int = 4
-    gpu_memory_utilization: float = 0.8
+    gpu_memory_utilization: float = 0.5
+    enforce_eager: bool = False
     # VAD params
     vad_threshold: float = 0.2
     min_speech_duration_ms: int = 250
     min_silence_duration_ms: int = 200
     speech_pad_ms: int = 100
-    max_speech_duration_s: float = 30.0
+    max_speech_duration_s: float = 120.0
     merge_gap_s: float = 0.3
     visualize_vad: bool = False
 

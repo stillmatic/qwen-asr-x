@@ -15,33 +15,44 @@ Result: 81x realtime throughput for 10 concurrent jobs on an RTX 4090 (vs 40x fo
 ## Pipeline
 
 ```
-Audio file (mp3, wav, m4a, ...)
-    │
-    ▼
-┌──────────────────┐
-│  ffmpeg / librosa │  Load + resample to 16kHz mono
-└────────┬─────────┘
-         ▼
-┌──────────────────┐
-│    Silero VAD     │  Detect speech segments, filter silence
-└────────┬─────────┘
-         ▼
-┌──────────────────┐
-│  Qwen3-ASR-1.7B  │  Transcribe each segment (vLLM backend)
-│     (vLLM)       │
-└────────┬─────────┘
-         ▼
-┌──────────────────┐
-│ Qwen3-ForcedAlign│  Word-level timestamps via forced alignment
-│      0.6B        │
-└────────┬─────────┘
-         ▼
-┌──────────────────┐
-│ pyannote speaker │  (Optional) Assign speaker labels
-│  diarization     │
-└────────┬─────────┘
-         ▼
-    JSON or SRT output
+                        POST /transcribe
+                              │
+                              ▼
+                    ┌───────────────────┐
+                    │    job_queue       │  Backpressure: max 50 queued
+                    └──┬─────┬─────┬────┘
+                       │     │     │
+              ┌────────┘     │     └────────┐
+              ▼              ▼              ▼
+       ┌────────────┐ ┌────────────┐ ┌────────────┐
+       │ VAD worker │ │ VAD worker │ │ VAD worker │  N parallel (CPU)
+       │  Silero #1 │ │  Silero #2 │ │  Silero #N │  ffmpeg ➜ 16kHz ➜ VAD
+       └─────┬──────┘ └─────┬──────┘ └─────┬──────┘
+             │              │              │
+             └──────┐       │       ┌──────┘
+                    ▼       ▼       ▼
+                ┌───────────────────────┐
+                │       asr_queue       │  Jobs wait until ASR is free
+                └───────────┬───────────┘
+                            │
+                            ▼
+              ┌──────────────────────────┐
+              │      ASR batcher         │  Drain queue ➜ merge segments
+              │                          │  from all ready jobs into one
+              │  ┌────────────────────┐  │  vLLM call (cross-job batching)
+              │  │  Qwen3-ASR (vLLM)  │  │
+              │  └────────┬───────────┘  │
+              │           ▼              │
+              │  ┌────────────────────┐  │
+              │  │  Forced aligner    │  │
+              │  └────────────────────┘  │
+              └──────────────┬───────────┘
+                             ▼
+                  ┌─────────────────────┐
+                  │  pyannote diarize   │  (Optional)
+                  └──────────┬──────────┘
+                             ▼
+                  GET /jobs/{id} ➜ JSON/SRT
 ```
 
 ## Requirements
@@ -95,7 +106,8 @@ uv run python main.py audio.mp3 -o output.json --language English
 | `--device` | `cuda:0` | GPU device |
 | `--language` | auto | Force language |
 | `--batch-size` | 4 | Max inference batch size |
-| `--gpu-memory-utilization` | 0.8 | vLLM GPU memory target |
+| `--gpu-memory-utilization` | 0.5 | vLLM GPU memory target |
+| `--enforce-eager` | false | Disable CUDA graphs to save ~500MB VRAM |
 | `--diarize` | false | Enable speaker diarization |
 | `--min-speakers` | auto | Min speakers hint |
 | `--max-speakers` | auto | Max speakers hint |

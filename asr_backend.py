@@ -27,20 +27,25 @@ class QwenBackend:
         device: str,
         batch_size: int,
         gpu_memory_utilization: float,
+        enforce_eager: bool,
         hf_token: Optional[str],
     ):
         import torch
         from qwen_asr import Qwen3ASRModel
 
-        self.asr = Qwen3ASRModel.LLM(
+        kwargs = dict(
             model=model,
             forced_aligner=None,
             max_inference_batch_size=batch_size,
             max_new_tokens=512,
             gpu_memory_utilization=gpu_memory_utilization,
+            max_model_len=2048,
             dtype="bfloat16",
             hf_token=hf_token,
         )
+        if enforce_eager:
+            kwargs["enforce_eager"] = True
+        self.asr = Qwen3ASRModel.LLM(**kwargs)
 
     def transcribe(
         self,
@@ -114,5 +119,6 @@ def create_backend(config) -> ASRBackend:
         device=config.device,
         batch_size=config.batch_size,
         gpu_memory_utilization=config.gpu_memory_utilization,
+        enforce_eager=config.enforce_eager,
         hf_token=config.hf_token,
     )

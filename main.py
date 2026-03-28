@@ -50,8 +50,12 @@ def main():
     parser.add_argument(
         "--gpu-memory-utilization",
         type=float,
-        default=0.8,
-        help="vLLM GPU memory utilization target (qwen only, default: 0.8)",
+        default=0.5,
+        help="vLLM GPU memory utilization target (qwen only, default: 0.5)",
+    )
+    parser.add_argument(
+        "--enforce-eager", action="store_true",
+        help="Disable CUDA graphs to save ~500MB VRAM (slightly slower)",
     )
     parser.add_argument(
         "--diarize", action="store_true", help="Enable speaker diarization"
@@ -119,6 +123,7 @@ def main():
         language=args.language,
         batch_size=args.batch_size,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        enforce_eager=args.enforce_eager,
         vad_threshold=args.vad_threshold,
         min_speech_duration_ms=args.min_speech_duration_ms,
         min_silence_duration_ms=args.min_silence_duration_ms,
