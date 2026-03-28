@@ -1,8 +1,16 @@
 # qwen-asr-x
 
-Speech transcription pipeline using [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) and [Silero VAD](https://github.com/snakers4/silero-vad). Inspired by [WhisperX](https://github.com/m-bain/whisperx).
+Experimenting with continuous batching strategies for speech transcription. Uses [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) (via vLLM) and [Silero VAD](https://github.com/snakers4/silero-vad), inspired by [WhisperX](https://github.com/m-bain/whisperx).
 
 Takes any audio format (via ffmpeg) and produces transcripts with word-level timestamps, automatic language detection, and optional speaker diarization.
+
+The server implements three key optimizations for multi-job throughput:
+
+1. **VAD/ASR disaggregation** -- VAD (CPU-bound) and ASR (GPU-bound) run as separate pipeline stages, so the next job's VAD overlaps with the current job's ASR.
+2. **Parallel VAD workers** -- N copies of Silero VAD process incoming jobs concurrently on CPU, keeping the GPU fed.
+3. **Cross-job ASR batching** -- the ASR worker drains all ready jobs and merges their segments into a single vLLM call, improving GPU utilization.
+
+Result: 81x realtime throughput for 10 concurrent jobs on an RTX 4090 (vs 40x for a single job). See [docs/FEATURES.md](docs/FEATURES.md) for benchmark details.
 
 ## Pipeline
 
@@ -144,26 +152,28 @@ Speaker prefixes are omitted when diarization is not enabled.
 
 ## Performance
 
-Benchmarked on a 21-minute NPR podcast (NVIDIA GPU):
+Benchmarked on a 21-minute NPR podcast, RTX 4090, Qwen3-ASR-1.7B, warm server:
 
-| Stage | Time |
-|-------|------|
-| Audio load | ~3s |
-| VAD | ~10s |
-| ASR (vLLM, 1.7B) | ~61s |
-| Forced alignment | included in ASR |
-| **Total (first run)** | **~124s** (~10x realtime) |
-| **Total (warm server)** | **~74s** (~17x realtime) |
+| Concurrent jobs | Wall time | Throughput |
+|-----------------|-----------|-----------|
+| 1               | 32s       | 40x RT    |
+| 5               | 86s       | 74x RT    |
+| 10              | 156s      | 81x RT    |
+
+Single-job breakdown: ~12s VAD (CPU) + ~20s ASR (GPU). Under load, parallel VAD workers and cross-job ASR batching keep the GPU saturated. See [docs/FEATURES.md](docs/FEATURES.md) for full benchmark results and architecture details.
 
 ## Project Structure
 
 ```
 main.py          CLI entrypoint
-server.py        FastAPI server with job queue
-pipeline.py      Pipeline orchestration and model management
+server.py        FastAPI server with parallel VAD workers + ASR batcher
+pipeline.py      Pipeline orchestration (prepare/run_asr_batch stages)
 vad.py           Silero VAD wrapper
+asr_backend.py   Pluggable ASR backends (Qwen vLLM, Cohere)
 output.py        JSON/SRT formatters and data structures
 diarize.py       pyannote speaker diarization
+bench.py         Server throughput benchmark
+vad_viewer.py    Interactive VAD debug viewer
 ```
 
 ## Supported Languages
