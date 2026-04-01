@@ -16,7 +16,7 @@ def main():
     )
     parser.add_argument(
         "--backend",
-        choices=["qwen", "cohere", "whisper"],
+        choices=["qwen", "cohere", "whisper", "firered"],
         default="qwen",
         help="ASR backend (default: qwen)",
     )
@@ -131,6 +131,7 @@ def main():
         "qwen": "Qwen/Qwen3-ASR-1.7B",
         "cohere": "CohereLabs/cohere-transcribe-03-2026",
         "whisper": "openai/whisper-large-v3",
+        "firered": "FireRedTeam/FireRedASR2-AED",
     }
     model = args.model or default_models[args.backend]
 

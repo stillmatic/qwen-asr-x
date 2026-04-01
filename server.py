@@ -36,7 +36,6 @@ from pydantic import BaseModel
 from pipeline import Pipeline, PipelineConfig, PreparedJob, _log
 from vad import SAMPLE_RATE, load_vad_model
 
-
 # --- Stats ---
 
 
@@ -99,7 +98,9 @@ class ServerStats:
             "avg_rtf": round(self.avg_rtf, 3) if self.avg_rtf is not None else None,
             "asr_utilization": round(self.asr_utilization, 3),
             "vad_utilization": round(self.vad_utilization, 3),
-            "avg_batch_size": round(self.avg_batch_size, 1) if self.avg_batch_size is not None else None,
+            "avg_batch_size": round(self.avg_batch_size, 1)
+            if self.avg_batch_size is not None
+            else None,
             "asr_batches": self.asr_batches,
             "queue_vad": job_queue.qsize() if job_queue else 0,
             "queue_asr": asr_queue.qsize() if asr_queue else 0,
@@ -107,6 +108,7 @@ class ServerStats:
 
 
 # --- Models ---
+
 
 class JobStatus(str, Enum):
     queued = "queued"
@@ -159,7 +161,8 @@ stats: ServerStats = None
 def _evict_old_jobs():
     """Remove oldest completed/errored jobs when count exceeds MAX_COMPLETED_JOBS."""
     terminal = [
-        (jid, j) for jid, j in jobs.items()
+        (jid, j)
+        for jid, j in jobs.items()
         if j.status in (JobStatus.done, JobStatus.error)
     ]
     if len(terminal) <= MAX_COMPLETED_JOBS:
@@ -175,10 +178,20 @@ def _evict_old_jobs():
 # --- Worker ---
 
 _COHERE_LANG_MAP = {
-    "arabic": "ar", "chinese": "zh", "dutch": "nl", "english": "en",
-    "french": "fr", "german": "de", "greek": "el", "italian": "it",
-    "japanese": "ja", "korean": "ko", "polish": "pl", "portuguese": "pt",
-    "spanish": "es", "vietnamese": "vi",
+    "arabic": "ar",
+    "chinese": "zh",
+    "dutch": "nl",
+    "english": "en",
+    "french": "fr",
+    "german": "de",
+    "greek": "el",
+    "italian": "it",
+    "japanese": "ja",
+    "korean": "ko",
+    "polish": "pl",
+    "portuguese": "pt",
+    "spanish": "es",
+    "vietnamese": "vi",
 }
 
 
@@ -207,7 +220,9 @@ def _prepare_job(job: Job, vad_model):
     job.audio_duration = len(job._prepared.audio) / SAMPLE_RATE
     job.num_vad_segments = len(job._prepared.vad_segments)
     stats.vad_busy_seconds += job.vad_finished_at - vad_start
-    _log(f"Job {job.job_id}: VAD done ({job.num_vad_segments} segments, {job.audio_duration:.1f}s audio)")
+    _log(
+        f"Job {job.job_id}: VAD done ({job.num_vad_segments} segments, {job.audio_duration:.1f}s audio)"
+    )
 
 
 def _run_asr_batch(batch: list[Job]):
@@ -235,8 +250,16 @@ def _run_asr_batch(batch: list[Job]):
         stats.total_processing_seconds += proc_time
         # Per-job completion log
         rtf = proc_time / job.audio_duration if job.audio_duration else 0
-        vad_t = (job.vad_finished_at - job.started_at) if job.vad_finished_at and job.started_at else 0
-        asr_t = (job.finished_at - job.vad_finished_at) if job.vad_finished_at else proc_time
+        vad_t = (
+            (job.vad_finished_at - job.started_at)
+            if job.vad_finished_at and job.started_at
+            else 0
+        )
+        asr_t = (
+            (job.finished_at - job.vad_finished_at)
+            if job.vad_finished_at
+            else proc_time
+        )
         _log(
             f"Job {job.job_id} done  |  "
             f"audio: {job.audio_duration:.1f}s  rtf: {rtf:.2f}  vad: {vad_t:.1f}s  asr: {asr_t:.1f}s  |  "
@@ -316,6 +339,7 @@ async def _asr_worker():
 
 # --- App ---
 
+
 async def _stats_printer():
     """Print a periodic stats summary every 30s when new jobs have completed."""
     while True:
@@ -364,7 +388,9 @@ async def transcribe(req: TranscribeRequest):
         raise HTTPException(status_code=400, detail=f"File not found: {req.audio_path}")
 
     if job_queue.qsize() >= MAX_QUEUE_DEPTH:
-        raise HTTPException(status_code=503, detail=f"Queue full ({MAX_QUEUE_DEPTH} pending jobs)")
+        raise HTTPException(
+            status_code=503, detail=f"Queue full ({MAX_QUEUE_DEPTH} pending jobs)"
+        )
 
     _evict_old_jobs()
 
@@ -443,7 +469,9 @@ async def list_jobs():
 async def get_stats():
     d = stats.to_dict()
     d["jobs_queued"] = job_queue.qsize()
-    d["jobs_in_flight"] = sum(1 for j in jobs.values() if j.status == JobStatus.processing)
+    d["jobs_in_flight"] = sum(
+        1 for j in jobs.values() if j.status == JobStatus.processing
+    )
     return d
 
 
@@ -476,38 +504,115 @@ def main():
     import uvicorn
 
     parser = argparse.ArgumentParser(description="qwen-asr-x transcription server")
-    parser.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0)")
-    parser.add_argument("--port", type=int, default=9090, help="Bind port (default: 9090)")
-    parser.add_argument("--backend", choices=["qwen", "cohere", "whisper"], default="qwen", help="ASR backend")
-    parser.add_argument("--model", default=None, help="ASR model (default depends on backend)")
-    parser.add_argument("--aligner", default="Qwen/Qwen3-ForcedAligner-0.6B", help="Aligner model")
+    parser.add_argument(
+        "--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0)"
+    )
+    parser.add_argument(
+        "--port", type=int, default=9090, help="Bind port (default: 9090)"
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["qwen", "cohere", "whisper", "firered"],
+        default="qwen",
+        help="ASR backend",
+    )
+    parser.add_argument(
+        "--model", default=None, help="ASR model (default depends on backend)"
+    )
+    parser.add_argument(
+        "--aligner", default="Qwen/Qwen3-ForcedAligner-0.6B", help="Aligner model"
+    )
     parser.add_argument("--device", default="cuda:0", help="Device")
     parser.add_argument("--batch-size", type=int, default=4, help="Batch size")
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.4, help="vLLM GPU memory target (qwen only, default: 0.4)")
-    parser.add_argument("--enforce-eager", action="store_true", help="Disable CUDA graphs to save ~500MB VRAM (slightly slower)")
-    parser.add_argument("--prompt", default=None, help="Default ASR prompt/context to guide transcription (vocabulary, domain hints)")
-    parser.add_argument("--max-queue", type=int, default=50, help="Max queued jobs before rejecting (default: 50)")
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.4,
+        help="vLLM GPU memory target (qwen only, default: 0.4)",
+    )
+    parser.add_argument(
+        "--enforce-eager",
+        action="store_true",
+        help="Disable CUDA graphs to save ~500MB VRAM (slightly slower)",
+    )
+    parser.add_argument(
+        "--prompt",
+        default=None,
+        help="Default ASR prompt/context to guide transcription (vocabulary, domain hints)",
+    )
+    parser.add_argument(
+        "--max-queue",
+        type=int,
+        default=50,
+        help="Max queued jobs before rejecting (default: 50)",
+    )
     parser.add_argument("--hf-token", default=None, help="HF token for gated models")
-    parser.add_argument("--diarize", action="store_true", help="Pre-load diarization model")
-    parser.add_argument("--skip-vad", action="store_true", help="Skip VAD and feed entire audio as a single segment")
-    parser.add_argument("--vad-backend", choices=["silero", "firered"], default="firered", help="VAD backend (default: silero)")
+    parser.add_argument(
+        "--diarize", action="store_true", help="Pre-load diarization model"
+    )
+    parser.add_argument(
+        "--skip-vad",
+        action="store_true",
+        help="Skip VAD and feed entire audio as a single segment",
+    )
+    parser.add_argument(
+        "--vad-backend",
+        choices=["silero", "firered"],
+        default="firered",
+        help="VAD backend (default: silero)",
+    )
     # VAD tuning
-    parser.add_argument("--vad-threshold", type=float, default=0.2, help="VAD threshold (default: 0.2)")
-    parser.add_argument("--min-speech-duration-ms", type=int, default=250, help="Min speech duration ms (default: 250)")
-    parser.add_argument("--min-silence-duration-ms", type=int, default=200, help="Min silence duration ms (default: 200)")
-    parser.add_argument("--speech-pad-ms", type=int, default=100, help="Speech padding ms (default: 100)")
-    parser.add_argument("--visualize-vad", action="store_true", help="Save VAD debug data to examples/vad/")
-    parser.add_argument("--vad-workers", type=int, default=4, help="Number of parallel VAD workers (default: 4)")
+    parser.add_argument(
+        "--vad-threshold", type=float, default=0.2, help="VAD threshold (default: 0.2)"
+    )
+    parser.add_argument(
+        "--min-speech-duration-ms",
+        type=int,
+        default=250,
+        help="Min speech duration ms (default: 250)",
+    )
+    parser.add_argument(
+        "--min-silence-duration-ms",
+        type=int,
+        default=200,
+        help="Min silence duration ms (default: 200)",
+    )
+    parser.add_argument(
+        "--speech-pad-ms",
+        type=int,
+        default=100,
+        help="Speech padding ms (default: 100)",
+    )
+    parser.add_argument(
+        "--visualize-vad",
+        action="store_true",
+        help="Save VAD debug data to examples/vad/",
+    )
+    parser.add_argument(
+        "--vad-workers",
+        type=int,
+        default=4,
+        help="Number of parallel VAD workers (default: 4)",
+    )
     # LLM postprocessing
-    parser.add_argument("--llm-postprocess", choices=["fix", "translate"], default=None,
-                        help="LLM postprocessing: 'fix' corrects errors, 'translate' translates to English")
-    parser.add_argument("--llm-model", default="Qwen/Qwen3-4B", help="LLM model for postprocessing (default: Qwen/Qwen3-4B)")
+    parser.add_argument(
+        "--llm-postprocess",
+        choices=["fix", "translate"],
+        default=None,
+        help="LLM postprocessing: 'fix' corrects errors, 'translate' translates to English",
+    )
+    parser.add_argument(
+        "--llm-model",
+        default="Qwen/Qwen3-4B",
+        help="LLM model for postprocessing (default: Qwen/Qwen3-4B)",
+    )
     args = parser.parse_args()
 
     default_models = {
         "qwen": "Qwen/Qwen3-ASR-1.7B",
         "cohere": "CohereLabs/cohere-transcribe-03-2026",
-        "whisper": "openai/whisper-large-v3",
+        "whisper": "openai/whisper-large-v3-turbo",
+        "firered": "FireRedTeam/FireRedASR2-AED",
     }
     model = args.model or default_models[args.backend]
 

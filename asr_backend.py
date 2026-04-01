@@ -75,7 +75,6 @@ class CohereBackend:
         batch_size: int,
         hf_token: Optional[str],
     ):
-        import torch
         from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 
         self.processor = AutoProcessor.from_pretrained(
@@ -111,6 +110,77 @@ class CohereBackend:
         ]
 
 
+class FireRedAEDBackend:
+    """FireRedASR2-AED via native fireredasr2s library."""
+
+    def __init__(
+        self,
+        model: str,
+        device: str,
+        batch_size: int,
+    ):
+        from fireredasr2s.fireredasr2 import FireRedAsr2, FireRedAsr2Config
+
+        asr_config = FireRedAsr2Config(
+            use_gpu="cuda" in device,
+            use_half=False,
+            beam_size=3,
+            nbest=1,
+            decode_max_len=0,
+            softmax_smoothing=1.25,
+            aed_length_penalty=0.6,
+            eos_penalty=1.0,
+            return_timestamp=False,
+        )
+        self.model = FireRedAsr2.from_pretrained("aed", model, asr_config)
+        self.batch_size = batch_size
+
+    def transcribe(
+        self,
+        audio: list[tuple[np.ndarray, int]],
+        language: Optional[str] = None,
+        prompt: Optional[str] = None,
+    ) -> list[ASRResult]:
+        import os
+        import tempfile
+        import wave
+
+        results: list[ASRResult] = []
+        for i in range(0, len(audio), self.batch_size):
+            batch = audio[i : i + self.batch_size]
+            tmp_paths: list[str] = []
+            uttids: list[str] = []
+            try:
+                for j, (arr, sr) in enumerate(batch):
+                    fd, path = tempfile.mkstemp(suffix=".wav")
+                    os.close(fd)
+                    tmp_paths.append(path)
+                    uttids.append(f"seg_{i + j}")
+                    int16 = (arr * 32767).clip(-32768, 32767).astype(np.int16)
+                    with wave.open(path, "wb") as wf:
+                        wf.setnchannels(1)
+                        wf.setsampwidth(2)
+                        wf.setframerate(sr)
+                        wf.writeframes(int16.tobytes())
+
+                batch_results = self.model.transcribe(uttids, tmp_paths)
+                for r in batch_results:
+                    results.append(
+                        ASRResult(
+                            text=(r.get("text", "") or "").strip(),
+                            language="",
+                        )
+                    )
+            finally:
+                for p in tmp_paths:
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
+
+        return results
+
+
 class WhisperBackend:
     """Whisper via vLLM encoder-decoder inference."""
 
@@ -143,6 +213,10 @@ class WhisperBackend:
         "hausa": "ha", "bashkir": "ba", "javanese": "jw", "sundanese": "su",
     }
 
+    # vLLM handles its own memory/scheduling, so we pass all segments in
+    # large batches and let the engine figure out parallelism.
+    preferred_batch_size = 256
+
     def __init__(
         self,
         model: str,
@@ -156,7 +230,7 @@ class WhisperBackend:
         kwargs = dict(
             model=model,
             max_model_len=448,
-            max_num_seqs=batch_size,
+            max_num_seqs=self.preferred_batch_size,
             limit_mm_per_prompt={"audio": 1},
             gpu_memory_utilization=gpu_memory_utilization,
             dtype="float16",
@@ -166,16 +240,12 @@ class WhisperBackend:
         if hf_token:
             kwargs["hf_token"] = hf_token
         self.llm = LLM(**kwargs)
-        self.batch_size = batch_size
 
-    def _build_prompt(self, language: Optional[str], prompt_text: Optional[str] = None) -> str:
+    def _build_prompt(self, language: Optional[str]) -> str:
         prompt = "<|startoftranscript|>"
         if language:
             lang_code = self._LANG_MAP.get(language.lower(), language.lower())
             prompt += f"<|{lang_code}|>"
-        prompt += "<|transcribe|><|notimestamps|>"
-        if prompt_text:
-            prompt += f" {prompt_text}"
         return prompt
 
     def transcribe(
@@ -186,19 +256,22 @@ class WhisperBackend:
     ) -> list[ASRResult]:
         from vllm import SamplingParams
 
-        decoder_prompt = self._build_prompt(language, prompt)
+        decoder_prompt = self._build_prompt(language)
         sampling_params = SamplingParams(
             temperature=0,
             top_p=1.0,
-            max_tokens=448,
+            max_tokens=200,
         )
 
         prompts = [
             {
-                "prompt": decoder_prompt,
-                "multi_modal_data": {
-                    "audio": (arr, sr),
+                "encoder_prompt": {
+                    "prompt": "",
+                    "multi_modal_data": {
+                        "audio": (arr, sr),
+                    },
                 },
+                "decoder_prompt": decoder_prompt,
             }
             for arr, sr in audio
         ]
@@ -231,6 +304,12 @@ def create_backend(config) -> ASRBackend:
             gpu_memory_utilization=config.gpu_memory_utilization,
             enforce_eager=config.enforce_eager,
             hf_token=config.hf_token,
+        )
+    if config.backend == "firered":
+        return FireRedAEDBackend(
+            model=config.model,
+            device=config.device,
+            batch_size=config.batch_size,
         )
     # default: qwen
     return QwenBackend(

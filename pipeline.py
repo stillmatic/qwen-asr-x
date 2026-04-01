@@ -273,8 +273,9 @@ class Pipeline:
             key = (job.language, job.prompt)
             group_to_seg_indices.setdefault(key, []).extend(range(seg_start, seg_end))
 
-        # Run ASR per group, chunked to avoid OOM
-        bs = self.config.batch_size
+        # Run ASR per group, chunked to avoid OOM.
+        # Backends with internal scheduling (vLLM) advertise a larger preferred_batch_size.
+        bs = getattr(self.asr, "preferred_batch_size", self.config.batch_size)
         all_asr_results = [None] * total_segs
         for (lang, prompt), seg_indices in group_to_seg_indices.items():
             for chunk_start in range(0, len(seg_indices), bs):

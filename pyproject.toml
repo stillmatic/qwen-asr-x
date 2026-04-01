@@ -6,9 +6,26 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "fastapi>=0.135.2",
-    "pyannote-audio>=4.0.4",
-    "qwen-asr[vllm]>=0.0.6",
     "silero-vad>=6.2.1",
-    "transformers>=4.57.6",
     "uvicorn>=0.42.0",
+]
+
+[project.optional-dependencies]
+qwen = [
+    "qwen-asr[vllm]>=0.0.6",
+]
+whisper = [
+    "vllm",
+]
+cohere = [
+    "transformers>=4.57.6",
+]
+# firered = [
+#    "fireredasr2s @ git+https://github.com/FireRedTeam/FireRedASR2S.git",
+# ]
+diarize = [
+    "pyannote-audio>=4.0.4",
+]
+all = [
+    "qwen-asr-x[qwen,whisper,cohere,diarize]",
 ]
