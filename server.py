@@ -2,13 +2,21 @@
 
 Start:  uv run python server.py
         uv run python server.py --port 9000 --model Qwen/Qwen3-ASR-0.6B
+        uv run python server.py --backend whisper
+        uv run python server.py --prompt "domain-specific vocabulary hints"
 
 API:
-    POST /transcribe        Submit a job (JSON body with "audio_path")
-    GET  /jobs/{job_id}     Poll job status and result
-    GET  /jobs              List all jobs
-    GET  /stats             Server-level metrics (throughput, RTF, utilization)
-    DELETE /jobs/{job_id}   Delete a completed job
+    POST /transcribe          Submit a job
+         Body: {"audio_path": str, "language"?: str, "prompt"?: str,
+                "align"?: bool, "diarize"?: bool,
+                "min_speakers"?: int, "max_speakers"?: int}
+         prompt: context/prefix to guide ASR (vocabulary hints, names, etc.)
+                 Supported by qwen (context) and whisper (initial prompt).
+    GET  /jobs/{job_id}       Poll job status and result
+    GET  /jobs                List all jobs
+    POST /jobs/{job_id}/cancel  Cancel a queued or in-progress job
+    GET  /stats               Server-level metrics (throughput, RTF, utilization)
+    DELETE /jobs/{job_id}     Delete a completed/cancelled job
 """
 
 import argparse
@@ -105,6 +113,7 @@ class JobStatus(str, Enum):
     processing = "processing"
     done = "done"
     error = "error"
+    cancelled = "cancelled"
 
 
 class Job:
@@ -127,6 +136,7 @@ class Job:
 class TranscribeRequest(BaseModel):
     audio_path: str
     language: Optional[str] = None
+    prompt: Optional[str] = None
     align: bool = True
     diarize: bool = False
     min_speakers: Optional[int] = None
@@ -187,6 +197,7 @@ def _prepare_job(job: Job, vad_model):
         job.audio_path,
         vad_model=vad_model,
         language=language,
+        prompt=job.config.get("prompt"),
         align=job.config.get("align", True),
         diarize=job.config.get("diarize", False),
         min_speakers=job.config.get("min_speakers"),
@@ -239,6 +250,10 @@ async def _vad_worker(vad_model):
     while True:
         job = await job_queue.get()
         try:
+            if job.status == JobStatus.cancelled:
+                _log(f"Job {job.job_id}: skipped (cancelled)")
+                job_queue.task_done()
+                continue
             await loop.run_in_executor(None, _prepare_job, job, vad_model)
             if not job._prepared.vad_segments:
                 # No speech detected — complete immediately
@@ -273,6 +288,16 @@ async def _asr_worker():
                 batch.append(asr_queue.get_nowait())
             except asyncio.QueueEmpty:
                 break
+        # Drop cancelled jobs before running ASR
+        cancelled = [j for j in batch if j.status == JobStatus.cancelled]
+        for j in cancelled:
+            j._prepared = None
+            _log(f"Job {j.job_id}: skipped ASR (cancelled)")
+        batch = [j for j in batch if j.status != JobStatus.cancelled]
+        if not batch:
+            for _ in cancelled:
+                asr_queue.task_done()
+            continue
         try:
             await loop.run_in_executor(None, _run_asr_batch, batch)
         except Exception as e:
@@ -285,7 +310,7 @@ async def _asr_worker():
                 stats.jobs_errored += 1
             _log(f"ASR batch error ({len(batch)} jobs)  |  {type(e).__name__}: {e}")
         finally:
-            for _ in batch:
+            for _ in batch + cancelled:
                 asr_queue.task_done()
 
 
@@ -349,6 +374,7 @@ async def transcribe(req: TranscribeRequest):
         audio_path=req.audio_path,
         config={
             "language": req.language,
+            "prompt": req.prompt,
             "align": req.align,
             "diarize": req.diarize,
             "min_speakers": req.min_speakers,
@@ -421,6 +447,20 @@ async def get_stats():
     return d
 
 
+@app.post("/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str):
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status in (JobStatus.done, JobStatus.error, JobStatus.cancelled):
+        raise HTTPException(status_code=409, detail=f"Job already {job.status.value}")
+    job.status = JobStatus.cancelled
+    job.finished_at = time.time()
+    job._prepared = None
+    _log(f"Job {job.job_id} cancelled")
+    return {"job_id": job_id, "status": "cancelled"}
+
+
 @app.delete("/jobs/{job_id}")
 async def delete_job(job_id: str):
     job = jobs.get(job_id)
@@ -438,16 +478,19 @@ def main():
     parser = argparse.ArgumentParser(description="qwen-asr-x transcription server")
     parser.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=9090, help="Bind port (default: 9090)")
-    parser.add_argument("--backend", choices=["qwen", "cohere"], default="qwen", help="ASR backend")
+    parser.add_argument("--backend", choices=["qwen", "cohere", "whisper"], default="qwen", help="ASR backend")
     parser.add_argument("--model", default=None, help="ASR model (default depends on backend)")
     parser.add_argument("--aligner", default="Qwen/Qwen3-ForcedAligner-0.6B", help="Aligner model")
     parser.add_argument("--device", default="cuda:0", help="Device")
     parser.add_argument("--batch-size", type=int, default=4, help="Batch size")
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.5, help="vLLM GPU memory target (qwen only, default: 0.5)")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.4, help="vLLM GPU memory target (qwen only, default: 0.4)")
     parser.add_argument("--enforce-eager", action="store_true", help="Disable CUDA graphs to save ~500MB VRAM (slightly slower)")
+    parser.add_argument("--prompt", default=None, help="Default ASR prompt/context to guide transcription (vocabulary, domain hints)")
     parser.add_argument("--max-queue", type=int, default=50, help="Max queued jobs before rejecting (default: 50)")
     parser.add_argument("--hf-token", default=None, help="HF token for gated models")
     parser.add_argument("--diarize", action="store_true", help="Pre-load diarization model")
+    parser.add_argument("--skip-vad", action="store_true", help="Skip VAD and feed entire audio as a single segment")
+    parser.add_argument("--vad-backend", choices=["silero", "firered"], default="firered", help="VAD backend (default: silero)")
     # VAD tuning
     parser.add_argument("--vad-threshold", type=float, default=0.2, help="VAD threshold (default: 0.2)")
     parser.add_argument("--min-speech-duration-ms", type=int, default=250, help="Min speech duration ms (default: 250)")
@@ -455,11 +498,16 @@ def main():
     parser.add_argument("--speech-pad-ms", type=int, default=100, help="Speech padding ms (default: 100)")
     parser.add_argument("--visualize-vad", action="store_true", help="Save VAD debug data to examples/vad/")
     parser.add_argument("--vad-workers", type=int, default=4, help="Number of parallel VAD workers (default: 4)")
+    # LLM postprocessing
+    parser.add_argument("--llm-postprocess", choices=["fix", "translate"], default=None,
+                        help="LLM postprocessing: 'fix' corrects errors, 'translate' translates to English")
+    parser.add_argument("--llm-model", default="Qwen/Qwen3-4B", help="LLM model for postprocessing (default: Qwen/Qwen3-4B)")
     args = parser.parse_args()
 
     default_models = {
         "qwen": "Qwen/Qwen3-ASR-1.7B",
         "cohere": "CohereLabs/cohere-transcribe-03-2026",
+        "whisper": "openai/whisper-large-v3",
     }
     model = args.model or default_models[args.backend]
 
@@ -474,6 +522,9 @@ def main():
         batch_size=args.batch_size,
         gpu_memory_utilization=args.gpu_memory_utilization,
         enforce_eager=args.enforce_eager,
+        prompt=args.prompt,
+        skip_vad=args.skip_vad,
+        vad_backend=args.vad_backend,
         hf_token=args.hf_token or os.environ.get("HF_TOKEN"),
         diarize=args.diarize,
         vad_threshold=args.vad_threshold,
@@ -481,6 +532,8 @@ def main():
         min_silence_duration_ms=args.min_silence_duration_ms,
         speech_pad_ms=args.speech_pad_ms,
         visualize_vad=args.visualize_vad,
+        llm_postprocess=args.llm_postprocess,
+        llm_model=args.llm_model,
     )
 
     # Load all models once at startup
@@ -491,7 +544,7 @@ def main():
     # Load extra VAD models for parallel workers (Pipeline already loaded one)
     n_vad = max(1, args.vad_workers)
     _log(f"Loading {n_vad} VAD model(s) for parallel workers...")
-    vad_models = [load_vad_model() for _ in range(n_vad)]
+    vad_models = [load_vad_model(config.vad_backend) for _ in range(n_vad)]
 
     _log(f"Starting server on {args.host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port)

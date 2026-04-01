@@ -30,6 +30,7 @@ class PreparedJob:
     vad_params: dict
     audio_path: str
     language: Optional[str]
+    prompt: Optional[str]
     align: bool
     diarize: bool
     min_speakers: Optional[int]
@@ -49,15 +50,22 @@ class PipelineConfig:
     min_speakers: Optional[int] = None
     max_speakers: Optional[int] = None
     language: Optional[str] = None
+    prompt: Optional[str] = None  # ASR context/prefix to guide transcription
     batch_size: int = 4
-    gpu_memory_utilization: float = 0.5
+    gpu_memory_utilization: float = 0.4
+    max_model_len: int = 1536
     enforce_eager: bool = False
+    # LLM postprocessing
+    llm_postprocess: Optional[str] = None  # "fix" or "translate"
+    llm_model: str = "Qwen/Qwen3-4B"
+    skip_vad: bool = False
+    vad_backend: str = "firered"  # "firered" or "silero"
     # VAD params
     vad_threshold: float = 0.2
     min_speech_duration_ms: int = 250
     min_silence_duration_ms: int = 200
     speech_pad_ms: int = 100
-    max_speech_duration_s: float = 120.0
+    max_speech_duration_s: float = 60.0
     merge_gap_s: float = 0.3
     visualize_vad: bool = False
 
@@ -111,12 +119,22 @@ def _free_gpu():
 class Pipeline:
     """Holds loaded models and runs transcription jobs without reloading."""
 
+    # Default ASR resource limits when LLM postprocessor is not competing for VRAM
+    _ASR_DEFAULTS_NO_LLM = {"gpu_memory_utilization": 0.6, "max_model_len": 4096}
+
+
     def __init__(self, config: PipelineConfig):
         self.config = config
 
+        # If no LLM postprocessor, give ASR more VRAM (unless user explicitly set values)
+        if not config.llm_postprocess:
+            for attr, val in self._ASR_DEFAULTS_NO_LLM.items():
+                if getattr(config, attr, None) == getattr(PipelineConfig, attr):
+                    setattr(config, attr, val)
+
         # Load VAD model
-        _log("Loading VAD model...")
-        self.vad_model = load_vad_model()
+        _log(f"Loading VAD model ({config.vad_backend})...")
+        self.vad_model = load_vad_model(config.vad_backend)
 
         # Load ASR backend
         _log(f"Loading ASR backend ({config.backend}): {config.model}")
@@ -134,6 +152,14 @@ class Pipeline:
             self.aligner = Qwen3ForcedAligner.from_pretrained(
                 config.aligner, **aligner_kwargs
             )
+
+        # Optionally load LLM postprocessor
+        self.llm_postprocessor = None
+        if config.llm_postprocess:
+            from llm_postprocess import LLMPostprocessor
+
+            _log(f"Loading LLM postprocessor: {config.llm_model}")
+            self.llm_postprocessor = LLMPostprocessor(config.llm_model, config.device)
 
         # Optionally pre-load diarization
         self.diar_pipeline = None
@@ -155,6 +181,7 @@ class Pipeline:
         *,
         vad_model=None,
         language: Optional[str] = None,
+        prompt: Optional[str] = None,
         align: Optional[bool] = None,
         diarize: Optional[bool] = None,
         min_speakers: Optional[int] = None,
@@ -176,30 +203,38 @@ class Pipeline:
         duration = len(audio) / SAMPLE_RATE
         _log(f"Audio loaded: {duration:.1f}s ({len(audio)} samples)")
 
-        # VAD
-        thresh = self.config.vad_threshold
-        _log(f"Running VAD (threshold={thresh})...")
-        vad_result = detect_speech(
-            audio,
-            model,
-            threshold=thresh,
-            min_speech_duration_ms=self.config.min_speech_duration_ms,
-            min_silence_duration_ms=self.config.min_silence_duration_ms,
-            speech_pad_ms=self.config.speech_pad_ms,
-            max_speech_duration_s=self.config.max_speech_duration_s,
-            merge_gap_s=self.config.merge_gap_s,
-        )
-        _log(f"VAD found {len(vad_result.segments)} speech segments")
+        if self.config.skip_vad:
+            _log("Skipping VAD, using entire audio as single segment")
+            vad_segments = [SpeechSegment(start=0.0, end=duration)]
+            vad_params = {}
+        else:
+            # VAD
+            thresh = self.config.vad_threshold
+            _log(f"Running VAD (threshold={thresh})...")
+            vad_result = detect_speech(
+                audio,
+                model,
+                threshold=thresh,
+                min_speech_duration_ms=self.config.min_speech_duration_ms,
+                min_silence_duration_ms=self.config.min_silence_duration_ms,
+                speech_pad_ms=self.config.speech_pad_ms,
+                max_speech_duration_s=self.config.max_speech_duration_s,
+                merge_gap_s=self.config.merge_gap_s,
+            )
+            vad_segments = vad_result.segments
+            vad_params = vad_result.params
+            _log(f"VAD found {len(vad_segments)} speech segments")
 
-        if self.config.visualize_vad:
-            self._save_vad_debug(audio_path, audio, vad_result.segments, vad_result.params, vad_model=model)
+            if self.config.visualize_vad:
+                self._save_vad_debug(audio_path, audio, vad_segments, vad_params, vad_model=model)
 
         return PreparedJob(
             audio=audio,
-            vad_segments=vad_result.segments,
-            vad_params=vad_result.params,
+            vad_segments=vad_segments,
+            vad_params=vad_params,
             audio_path=audio_path,
             language=language or self.config.language,
+            prompt=prompt or self.config.prompt,
             align=align,
             diarize=diarize,
             min_speakers=min_speakers or self.config.min_speakers,
@@ -227,23 +262,27 @@ class Pipeline:
             job_slices.append((start, len(all_audio_segments)))
 
         total_segs = len(all_audio_segments)
-        _log(f"Batch ASR: {total_segs} segments from {len(jobs)} jobs")
+        prompts = {j.prompt for j in jobs if j.prompt}
+        prompt_str = f", prompt={next(iter(prompts))!r}" if len(prompts) == 1 else (f", prompts={prompts}" if prompts else "")
+        _log(f"Batch ASR: {total_segs} segments from {len(jobs)} jobs{prompt_str}")
 
-        # Group segments by language for ASR calls
-        lang_to_seg_indices: dict[Optional[str], list[int]] = {}
+        # Group segments by (language, prompt) for ASR calls
+        group_to_seg_indices: dict[tuple[Optional[str], Optional[str]], list[int]] = {}
         for job_idx, job in enumerate(jobs):
             seg_start, seg_end = job_slices[job_idx]
-            lang_to_seg_indices.setdefault(job.language, []).extend(range(seg_start, seg_end))
+            key = (job.language, job.prompt)
+            group_to_seg_indices.setdefault(key, []).extend(range(seg_start, seg_end))
 
-        # Run ASR per language group
+        # Run ASR per group, chunked to avoid OOM
+        bs = self.config.batch_size
         all_asr_results = [None] * total_segs
-        for lang, seg_indices in lang_to_seg_indices.items():
-            group_audio = [all_audio_segments[i] for i in seg_indices]
-            if not group_audio:
-                continue
-            group_results = self.asr.transcribe(audio=group_audio, language=lang)
-            for si, result in zip(seg_indices, group_results):
-                all_asr_results[si] = result
+        for (lang, prompt), seg_indices in group_to_seg_indices.items():
+            for chunk_start in range(0, len(seg_indices), bs):
+                chunk_indices = seg_indices[chunk_start:chunk_start + bs]
+                chunk_audio = [all_audio_segments[i] for i in chunk_indices]
+                chunk_results = self.asr.transcribe(audio=chunk_audio, language=lang, prompt=prompt)
+                for si, result in zip(chunk_indices, chunk_results):
+                    all_asr_results[si] = result
 
         # Forced alignment in one batch (aligner handles per-segment language)
         all_align_results = [None] * total_segs
@@ -259,13 +298,15 @@ class Pipeline:
 
             if to_align:
                 _log(f"Batch align: {len(to_align)} segments")
-                aligned = self.aligner.align(
-                    audio=[sa for _, sa, _ in to_align],
-                    text=[r.text for _, _, r in to_align],
-                    language=[r.language or "English" for _, _, r in to_align],
-                )
-                for (i, _, _), ar in zip(to_align, aligned):
-                    all_align_results[i] = ar
+                for chunk_start in range(0, len(to_align), bs):
+                    chunk = to_align[chunk_start:chunk_start + bs]
+                    aligned = self.aligner.align(
+                        audio=[sa for _, sa, _ in chunk],
+                        text=[r.text for _, _, r in chunk],
+                        language=[r.language or "English" for _, _, r in chunk],
+                    )
+                    for (i, _, _), ar in zip(chunk, aligned):
+                        all_align_results[i] = ar
 
         # Diarization runs per-job in background threads
         diarize_executor = None
@@ -341,6 +382,14 @@ class Pipeline:
                     turns = future.result()
                     per_job_results[i] = assign_speakers(per_job_results[i], turns)
 
+            # LLM postprocessing (fix or translate)
+            if self.llm_postprocessor and self.config.llm_postprocess:
+                for i, results in enumerate(per_job_results):
+                    if results:
+                        per_job_results[i] = self.llm_postprocessor.process(
+                            results, mode=self.config.llm_postprocess
+                        )
+
             return per_job_results
         finally:
             if diarize_executor is not None:
@@ -351,6 +400,7 @@ class Pipeline:
         audio_path: str,
         *,
         language: Optional[str] = None,
+        prompt: Optional[str] = None,
         align: Optional[bool] = None,
         diarize: Optional[bool] = None,
         min_speakers: Optional[int] = None,
@@ -360,6 +410,7 @@ class Pipeline:
         prepared = self.prepare(
             audio_path,
             language=language,
+            prompt=prompt,
             align=align,
             diarize=diarize,
             min_speakers=min_speakers,

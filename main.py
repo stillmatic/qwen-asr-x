@@ -16,7 +16,7 @@ def main():
     )
     parser.add_argument(
         "--backend",
-        choices=["qwen", "cohere"],
+        choices=["qwen", "cohere", "whisper"],
         default="qwen",
         help="ASR backend (default: qwen)",
     )
@@ -42,6 +42,10 @@ def main():
         "--language", default=None, help="Force language (auto-detect if omitted)"
     )
     parser.add_argument(
+        "--prompt", default=None,
+        help="ASR prompt/context to guide transcription (vocabulary, domain hints)",
+    )
+    parser.add_argument(
         "--batch-size",
         type=int,
         default=4,
@@ -50,8 +54,8 @@ def main():
     parser.add_argument(
         "--gpu-memory-utilization",
         type=float,
-        default=0.5,
-        help="vLLM GPU memory utilization target (qwen only, default: 0.5)",
+        default=0.4,
+        help="vLLM GPU memory utilization target (qwen only, default: 0.4)",
     )
     parser.add_argument(
         "--enforce-eager", action="store_true",
@@ -93,11 +97,31 @@ def main():
         help="Speech padding in ms (default: 100)",
     )
     parser.add_argument(
+        "--skip-vad", action="store_true",
+        help="Skip VAD and feed entire audio as a single segment",
+    )
+    parser.add_argument(
+        "--vad-backend", choices=["silero", "firered"], default="firered",
+        help="VAD backend (default: silero)",
+    )
+    parser.add_argument(
         "--save-vad", default=None, help="Save VAD segments to JSON file"
     )
     parser.add_argument(
         "--visualize-vad", action="store_true",
         help="Save VAD probability plot (silero_vad_figure.png)",
+    )
+    # LLM postprocessing
+    parser.add_argument(
+        "--llm-postprocess",
+        choices=["fix", "translate"],
+        default=None,
+        help="LLM postprocessing: 'fix' corrects errors, 'translate' translates to English",
+    )
+    parser.add_argument(
+        "--llm-model",
+        default="Qwen/Qwen3-4B",
+        help="LLM model for postprocessing (default: Qwen/Qwen3.5-9B)",
     )
     args = parser.parse_args()
 
@@ -106,6 +130,7 @@ def main():
     default_models = {
         "qwen": "Qwen/Qwen3-ASR-1.7B",
         "cohere": "CohereLabs/cohere-transcribe-03-2026",
+        "whisper": "openai/whisper-large-v3",
     }
     model = args.model or default_models[args.backend]
 
@@ -121,15 +146,19 @@ def main():
         min_speakers=args.min_speakers,
         max_speakers=args.max_speakers,
         language=args.language,
+        prompt=args.prompt,
         batch_size=args.batch_size,
         gpu_memory_utilization=args.gpu_memory_utilization,
         enforce_eager=args.enforce_eager,
+        skip_vad=args.skip_vad,
+        vad_backend=args.vad_backend,
         vad_threshold=args.vad_threshold,
         min_speech_duration_ms=args.min_speech_duration_ms,
         min_silence_duration_ms=args.min_silence_duration_ms,
         speech_pad_ms=args.speech_pad_ms,
-        save_vad=args.save_vad,
         visualize_vad=args.visualize_vad,
+        llm_postprocess=args.llm_postprocess,
+        llm_model=args.llm_model,
     )
 
     segments = run_pipeline(args.audio, config)

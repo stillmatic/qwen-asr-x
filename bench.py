@@ -40,8 +40,11 @@ async def submit_and_poll(
             return data
 
 
-def audio_duration_from_result(result: list[dict]) -> float:
-    """Estimate audio duration from the last segment's end time."""
+def audio_duration_from_job(job: dict) -> float:
+    """Get audio duration from job response (server-reported or estimated from segments)."""
+    if job.get("audio_duration"):
+        return job["audio_duration"]
+    result = job.get("result", [])
     if not result:
         return 0.0
     return max(seg["end"] for seg in result)
@@ -95,9 +98,9 @@ async def run_bench(args):
 
     # Header
     if has_vad_timing:
-        hdr = f"{'job_id':<14} {'audio':<30} {'queue':>7} {'vad':>7} {'asr':>7} {'total':>7} {'segs':>5} {'status':<6}"
+        hdr = f"{'job_id':<14} {'audio':<30} {'dur':>6} {'queue':>7} {'vad':>7} {'asr':>7} {'total':>7} {'rtf':>6} {'segs':>5} {'status':<6}"
     else:
-        hdr = f"{'job_id':<14} {'audio':<30} {'queue':>7} {'proc':>7} {'total':>7} {'segs':>5} {'status':<6}"
+        hdr = f"{'job_id':<14} {'audio':<30} {'dur':>6} {'queue':>7} {'proc':>7} {'total':>7} {'rtf':>6} {'segs':>5} {'status':<6}"
     print(hdr)
     print("-" * len(hdr))
 
@@ -117,20 +120,27 @@ async def run_bench(args):
         queue_wait = (started - created) if started else None
         total = (finished - created) if finished else None
 
-        seg_count = len(r.get("result", []))
-        audio_dur = audio_duration_from_result(r.get("result", []))
+        seg_count = r.get("num_asr_segments", len(r.get("result", [])))
+        audio_dur = audio_duration_from_job(r)
         total_audio_dur += audio_dur
+
+        rtf = r.get("rtf")
+        if rtf is None and started and finished and audio_dur > 0:
+            rtf = round((finished - started) / audio_dur, 3)
 
         if status == "error":
             errors += 1
 
+        dur_str = f"{audio_dur:.0f}s" if audio_dur else "-"
+        rtf_str = f"{rtf:.2f}" if rtf is not None else "-"
+
         if has_vad_timing and started and vad_finished and finished:
             vad_time = vad_finished - started
             asr_time = finished - vad_finished
-            print(f"{job_id:<14} {audio_name:<30} {fmt_sec(queue_wait):>7} {fmt_sec(vad_time):>7} {fmt_sec(asr_time):>7} {fmt_sec(total):>7} {seg_count:>5} {status:<6}")
+            print(f"{job_id:<14} {audio_name:<30} {dur_str:>6} {fmt_sec(queue_wait):>7} {fmt_sec(vad_time):>7} {fmt_sec(asr_time):>7} {fmt_sec(total):>7} {rtf_str:>6} {seg_count:>5} {status:<6}")
         else:
             proc_time = (finished - started) if (started and finished) else None
-            print(f"{job_id:<14} {audio_name:<30} {fmt_sec(queue_wait):>7} {fmt_sec(proc_time):>7} {fmt_sec(total):>7} {seg_count:>5} {status:<6}")
+            print(f"{job_id:<14} {audio_name:<30} {dur_str:>6} {fmt_sec(queue_wait):>7} {fmt_sec(proc_time):>7} {fmt_sec(total):>7} {rtf_str:>6} {seg_count:>5} {status:<6}")
 
     print()
     print(f"Wall time:           {wall_time:.1f}s")
@@ -156,6 +166,24 @@ async def run_bench(args):
     if queue_waits:
         print(f"Max queue wait:      {max(queue_waits):.1f}s")
 
+    # Fetch server stats
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10)) as client:
+            resp = await client.get(f"{args.server}/stats")
+            if resp.status_code == 200:
+                s = resp.json()
+                print()
+                print("Server stats:")
+                print(f"  ASR utilization:   {s.get('asr_utilization', 0):.1%}")
+                print(f"  VAD utilization:   {s.get('vad_utilization', 0):.1%}")
+                print(f"  Avg batch size:    {s.get('avg_batch_size') or '-'}")
+                print(f"  Avg RTF:           {s.get('avg_rtf') or '-'}")
+                print(f"  Server throughput: {s.get('throughput', 0):.1f}x realtime")
+                print(f"  ASR batches:       {s.get('asr_batches', 0)}")
+                print(f"  Server uptime:     {s.get('uptime', 0):.0f}s")
+    except Exception:
+        pass  # stats endpoint not available (older server)
+
     if args.json:
         summary = {
             "wall_time": round(wall_time, 2),
@@ -174,8 +202,9 @@ async def run_bench(args):
                     "processing_time": round((r.get("finished_at", 0) - r.get("started_at", 0)), 2) if r.get("started_at") and r.get("finished_at") else None,
                     "vad_time": round((r["vad_finished_at"] - r["started_at"]), 2) if r.get("vad_finished_at") and r.get("started_at") else None,
                     "asr_time": round((r["finished_at"] - r["vad_finished_at"]), 2) if r.get("vad_finished_at") and r.get("finished_at") else None,
-                    "audio_duration": round(audio_duration_from_result(r.get("result", [])), 2),
-                    "segments": len(r.get("result", [])),
+                    "rtf": r.get("rtf"),
+                    "audio_duration": round(audio_duration_from_job(r), 2),
+                    "segments": r.get("num_asr_segments", len(r.get("result", []))),
                 }
                 for i, r in enumerate(results)
             ],

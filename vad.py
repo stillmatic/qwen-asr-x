@@ -20,8 +20,30 @@ class VadResult:
     params: dict  # the actual params used (threshold, min_speech_duration_ms, etc.)
 
 
-def load_vad_model():
+def load_vad_model(backend: str = "silero"):
+    if backend == "firered":
+        return _load_firered_vad()
     return load_silero_vad()
+
+
+def _load_firered_vad():
+    from huggingface_hub import snapshot_download
+    from fireredvad import FireRedVad, FireRedVadConfig
+
+    model_dir = snapshot_download("FireRedTeam/FireRedVAD")
+    vad_dir = f"{model_dir}/VAD"
+    config = FireRedVadConfig(
+        use_gpu=torch.cuda.is_available(),
+        smooth_window_size=5,
+        speech_threshold=0.4,
+        min_speech_frame=20,
+        max_speech_frame=3000,
+        min_silence_frame=10,
+        merge_silence_frame=0,
+        extend_speech_frame=0,
+        chunk_max_frame=30000,
+    )
+    return FireRedVad.from_pretrained(vad_dir, config)
 
 
 @dataclass
@@ -229,6 +251,20 @@ def _segment_from_probs(
     return segments
 
 
+def _detect_speech_firered(audio: np.ndarray, model, merge_gap_s: float) -> VadResult:
+    """Run FireRedVAD on 16kHz mono float32 audio."""
+    # FireRedVAD expects int16
+    audio_int16 = (audio * 32767).astype(np.int16)
+    result, _probs = model.detect(audio_int16)
+    segments = [
+        SpeechSegment(start=round(s, 3), end=round(e, 3))
+        for s, e in result["timestamps"]
+    ]
+    if merge_gap_s > 0:
+        segments = _merge_close_segments(segments, merge_gap_s)
+    return VadResult(segments=segments, params={"backend": "firered"})
+
+
 def detect_speech(
     audio: np.ndarray,
     model,
@@ -241,11 +277,19 @@ def detect_speech(
     merge_gap_s: float = 0.3,
     window_size_samples: int = 512,
 ) -> VadResult:
-    """Run Silero VAD on 16kHz mono audio and return speech segments.
+    """Run VAD on 16kHz mono audio and return speech segments.
 
+    Supports Silero VAD models and FireRedVAD models.
     threshold: Speech probability threshold. None means auto (Otsu's method),
                which also auto-derives min_speech, min_silence, pad, and merge_gap.
     """
+    # FireRedVAD path
+    try:
+        from fireredvad import FireRedVad
+        if isinstance(model, FireRedVad):
+            return _detect_speech_firered(audio, model, merge_gap_s)
+    except ImportError:
+        pass
     if threshold is None:
         # Auto mode: derive all params from the probability curve
         import sys
