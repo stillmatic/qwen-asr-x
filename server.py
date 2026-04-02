@@ -30,10 +30,13 @@ from dataclasses import asdict
 from enum import Enum
 from typing import Optional
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from pipeline import Pipeline, PipelineConfig, PreparedJob, _log
+from pipeline import Pipeline, PreparedJob, _log
+
+load_dotenv()
 from vad import SAMPLE_RATE, load_vad_model
 
 # --- Stats ---
@@ -503,7 +506,10 @@ async def delete_job(job_id: str):
 def main():
     import uvicorn
 
+    from pipeline import add_pipeline_args, config_from_args
+
     parser = argparse.ArgumentParser(description="qwen-asr-x transcription server")
+    # server-only args
     parser.add_argument(
         "--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0)"
     )
@@ -511,82 +517,10 @@ def main():
         "--port", type=int, default=9090, help="Bind port (default: 9090)"
     )
     parser.add_argument(
-        "--backend",
-        choices=["qwen", "cohere", "whisper", "firered"],
-        default="qwen",
-        help="ASR backend",
-    )
-    parser.add_argument(
-        "--model", default=None, help="ASR model (default depends on backend)"
-    )
-    parser.add_argument(
-        "--aligner", default="Qwen/Qwen3-ForcedAligner-0.6B", help="Aligner model"
-    )
-    parser.add_argument("--device", default="cuda:0", help="Device")
-    parser.add_argument("--batch-size", type=int, default=4, help="Batch size")
-    parser.add_argument(
-        "--gpu-memory-utilization",
-        type=float,
-        default=0.4,
-        help="vLLM GPU memory target (qwen only, default: 0.4)",
-    )
-    parser.add_argument(
-        "--enforce-eager",
-        action="store_true",
-        help="Disable CUDA graphs to save ~500MB VRAM (slightly slower)",
-    )
-    parser.add_argument(
-        "--prompt",
-        default=None,
-        help="Default ASR prompt/context to guide transcription (vocabulary, domain hints)",
-    )
-    parser.add_argument(
         "--max-queue",
         type=int,
         default=50,
         help="Max queued jobs before rejecting (default: 50)",
-    )
-    parser.add_argument("--hf-token", default=None, help="HF token for gated models")
-    parser.add_argument(
-        "--diarize", action="store_true", help="Pre-load diarization model"
-    )
-    parser.add_argument(
-        "--skip-vad",
-        action="store_true",
-        help="Skip VAD and feed entire audio as a single segment",
-    )
-    parser.add_argument(
-        "--vad-backend",
-        choices=["silero", "firered"],
-        default="firered",
-        help="VAD backend (default: silero)",
-    )
-    # VAD tuning
-    parser.add_argument(
-        "--vad-threshold", type=float, default=0.2, help="VAD threshold (default: 0.2)"
-    )
-    parser.add_argument(
-        "--min-speech-duration-ms",
-        type=int,
-        default=250,
-        help="Min speech duration ms (default: 250)",
-    )
-    parser.add_argument(
-        "--min-silence-duration-ms",
-        type=int,
-        default=200,
-        help="Min silence duration ms (default: 200)",
-    )
-    parser.add_argument(
-        "--speech-pad-ms",
-        type=int,
-        default=100,
-        help="Speech padding ms (default: 100)",
-    )
-    parser.add_argument(
-        "--visualize-vad",
-        action="store_true",
-        help="Save VAD debug data to examples/vad/",
     )
     parser.add_argument(
         "--vad-workers",
@@ -594,56 +528,17 @@ def main():
         default=4,
         help="Number of parallel VAD workers (default: 4)",
     )
-    # LLM postprocessing
-    parser.add_argument(
-        "--llm-postprocess",
-        choices=["fix", "translate"],
-        default=None,
-        help="LLM postprocessing: 'fix' corrects errors, 'translate' translates to English",
-    )
-    parser.add_argument(
-        "--llm-model",
-        default="Qwen/Qwen3-4B",
-        help="LLM model for postprocessing (default: Qwen/Qwen3-4B)",
-    )
+    add_pipeline_args(parser)
     args = parser.parse_args()
-
-    default_models = {
-        "qwen": "Qwen/Qwen3-ASR-1.7B",
-        "cohere": "CohereLabs/cohere-transcribe-03-2026",
-        "whisper": "openai/whisper-large-v3-turbo",
-        "firered": "FireRedTeam/FireRedASR2-AED",
-    }
-    model = args.model or default_models[args.backend]
 
     global MAX_QUEUE_DEPTH
     MAX_QUEUE_DEPTH = args.max_queue
 
-    config = PipelineConfig(
-        backend=args.backend,
-        model=model,
-        aligner=args.aligner,
-        device=args.device,
-        batch_size=args.batch_size,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        enforce_eager=args.enforce_eager,
-        prompt=args.prompt,
-        skip_vad=args.skip_vad,
-        vad_backend=args.vad_backend,
-        hf_token=args.hf_token or os.environ.get("HF_TOKEN"),
-        diarize=args.diarize,
-        vad_threshold=args.vad_threshold,
-        min_speech_duration_ms=args.min_speech_duration_ms,
-        min_silence_duration_ms=args.min_silence_duration_ms,
-        speech_pad_ms=args.speech_pad_ms,
-        visualize_vad=args.visualize_vad,
-        llm_postprocess=args.llm_postprocess,
-        llm_model=args.llm_model,
-    )
+    config = config_from_args(args)
 
     # Load all models once at startup
     global pipeline, vad_models
-    _log(f"Initializing pipeline: {model} ({args.backend})")
+    _log(f"Initializing pipeline: {config.model} ({config.backend})")
     pipeline = Pipeline(config)
 
     # Load extra VAD models for parallel workers (Pipeline already loaded one)

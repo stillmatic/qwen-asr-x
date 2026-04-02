@@ -1,4 +1,6 @@
+.env
 examples/
+debug/
 .hermit/
 # Python-generated files
 __pycache__/
